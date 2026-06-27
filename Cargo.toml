@@ -1,0 +1,20 @@
+[package]
+name = "jsonrpc-usecase"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["jsonrpc-usecase-macros"]
+resolver = "3"
+
+[features]
+default = []
+axum = ["dep:axum"]
+
+[dependencies]
+axum = { version = "0.8", optional = true, default-features = false, features = ["json", "tokio", "http1"] }
+futures = { version = "0.3", features = ["executor"] }
+inventory = "0.3"
+jsonrpc-usecase-macros = { version = "0.1.0", path = "jsonrpc-usecase-macros" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
