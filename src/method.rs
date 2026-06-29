@@ -1,6 +1,7 @@
 use crate::{
     case,
-    event::{self, EventRequest, UseCaseEvent},
+    event::{self, UseCaseEvent},
+    guard::GuardContext,
     response::JsonRpcErrorObject,
     use_case::UseCaseDefinition,
 };
@@ -11,7 +12,7 @@ use std::{future::Future, pin::Pin};
 pub trait RpcMethod: Send + Sync {
     fn call<'a>(
         &'a self,
-        request: EventRequest,
+        context: GuardContext,
         params: Option<Value>,
     ) -> Pin<Box<dyn Future<Output = Result<MethodSuccess, JsonRpcErrorObject>> + Send + 'a>>;
 }
@@ -37,11 +38,17 @@ where
 {
     fn call<'a>(
         &'a self,
-        request: EventRequest,
+        context: GuardContext,
         params: Option<Value>,
     ) -> Pin<Box<dyn Future<Output = Result<MethodSuccess, JsonRpcErrorObject>> + Send + 'a>> {
         Box::pin(async move {
-            let event_request = request;
+            if !U::can_proceed(&context) {
+                return Err(JsonRpcErrorObject::access_denied(Some(json!({
+                    "method": context.request().method(),
+                }))));
+            }
+
+            let event_request = context.request().clone();
             let params = params.unwrap_or(Value::Null);
             let (input, event_input) = deserialize_input::<U::Input>(params)?;
 

@@ -1,9 +1,9 @@
-use crate::JsonRpcService;
+use crate::{JsonRpcService, RequestHeaders};
 use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::{StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -16,10 +16,20 @@ pub fn router(service: JsonRpcService) -> Router {
         .with_state(service)
 }
 
-async fn handle_rpc(State(service): State<JsonRpcService>, body: Bytes) -> Response {
+async fn handle_rpc(
+    State(service): State<JsonRpcService>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let body = String::from_utf8_lossy(&body);
+    let headers = RequestHeaders::new(headers.iter().filter_map(|(name, value)| {
+        value
+            .to_str()
+            .ok()
+            .map(|value| (name.as_str(), value.to_owned()))
+    }));
 
-    match service.handle_json(&body).await {
+    match service.handle_json_with_headers(&body, headers).await {
         Some(response) => ([(CONTENT_TYPE, "application/json")], response).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     }

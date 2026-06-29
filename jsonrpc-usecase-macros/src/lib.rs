@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     Expr, FnArg, GenericArgument, ImplItem, ImplItemFn, Item, ItemFn, ItemImpl, ItemStruct, Lit,
-    LitStr, Meta, PatType, PathArguments, ReturnType, Type, parse_macro_input,
+    LitStr, Meta, PatType, PathArguments, ReturnType, Type, TypePath, parse_macro_input,
     punctuated::Punctuated,
 };
 
@@ -50,8 +50,10 @@ fn expand_use_case(
 
     let self_ty = item_impl.self_ty.as_ref();
     let use_case_name = use_case_name(self_ty)?;
-    let method = method_name_from_args(args)?.unwrap_or_else(|| use_case_name.clone());
+    let args = use_case_args_from_args(args)?;
+    let method = args.method.unwrap_or_else(|| use_case_name.clone());
     let method = LitStr::new(&method, proc_macro2::Span::call_site());
+    let guards = args.guards;
     let will_event = LitStr::new(
         &format!("Will{use_case_name}"),
         proc_macro2::Span::call_site(),
@@ -75,6 +77,13 @@ fn expand_use_case(
 
             const WILL_EVENT: &'static str = #will_event;
             const DID_EVENT: &'static str = #did_event;
+
+            fn can_proceed(context: &::jsonrpc_usecase::__private::GuardContext) -> bool {
+                true #(&& <#guards as ::jsonrpc_usecase::__private::Guard>::can_proceed(
+                    &<#guards as ::std::default::Default>::default(),
+                    context,
+                ))*
+            }
 
             fn execute(
                 &self,
@@ -220,8 +229,14 @@ fn event_consumer_registration(
     }
 }
 
-fn method_name_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<Option<String>> {
+struct UseCaseArgs {
+    method: Option<String>,
+    guards: Vec<Type>,
+}
+
+fn use_case_args_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<UseCaseArgs> {
     let mut method = None;
+    let mut guards = Vec::new();
 
     for arg in args {
         match arg {
@@ -248,16 +263,35 @@ fn method_name_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<
                 }
                 method = Some(value);
             }
+            Meta::NameValue(name_value) if name_value.path.is_ident("guards") => {
+                let Expr::Array(array) = name_value.value else {
+                    return Err(syn::Error::new_spanned(
+                        name_value,
+                        "expected `guards = [GuardType, ...]`",
+                    ));
+                };
+
+                for guard in array.elems {
+                    let Expr::Path(expr_path) = guard else {
+                        return Err(syn::Error::new_spanned(guard, "guards must be type paths"));
+                    };
+
+                    guards.push(Type::Path(TypePath {
+                        qself: expr_path.qself,
+                        path: expr_path.path,
+                    }));
+                }
+            }
             meta => {
                 return Err(syn::Error::new_spanned(
                     meta,
-                    "expected `method = \"MethodName\"`",
+                    "expected `method = \"MethodName\"` or `guards = [GuardType, ...]`",
                 ));
             }
         }
     }
 
-    Ok(method)
+    Ok(UseCaseArgs { method, guards })
 }
 
 fn event_name_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<LitStr> {

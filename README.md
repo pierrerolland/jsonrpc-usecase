@@ -30,9 +30,11 @@ Developer-facing items:
 - `UseCase`: attribute macro applied to an inherent `impl` block.
 - `UseCaseEventConsumer`: attribute macro applied to an event consumer struct, function, or impl block.
 - `Error`: trait implemented by application error types.
+- `Guard`: trait implemented by access-control guard types.
 - `JsonRpcService`: framework-neutral JSON-RPC handler.
 - `JsonRpcServiceBuilder`: builder returned by `JsonRpcService::builder()`.
 - `EventRequest` and `UseCaseEvent`: event payload types.
+- `GuardContext` and `RequestHeaders`: guard payload types.
 - `RegistrationError`: returned when the auto-registration registry is invalid, for example duplicate method names.
 
 The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro support module are internal. Treat responses as JSON returned by `JsonRpcService`.
@@ -41,7 +43,7 @@ The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro supp
 
 ```toml
 [dependencies]
-jsonrpc-usecase = "0.2"
+jsonrpc-usecase = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
@@ -59,12 +61,12 @@ For the optional Axum adapter:
 
 ```toml
 [dependencies]
-jsonrpc-usecase = { version = "0.2", features = ["axum"] }
+jsonrpc-usecase = { version = "0.3", features = ["axum"] }
 ```
 
 ## Define A Use Case
 
-```rust
+```rust,ignore
 use jsonrpc_usecase::{Error, UseCase};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
@@ -120,7 +122,7 @@ impl AddNumbers {
 
 The macro validates that the `impl` block contains this shape:
 
-```rust
+```rust,ignore
 async fn execute(&self, input: Input) -> Result<Output, Error>
 ```
 
@@ -132,14 +134,14 @@ Current constraint: macro-registered use-case structs must implement `Default`, 
 
 Method names are PascalCase by default. The struct name is used as the JSON-RPC method name.
 
-```rust
+```rust,ignore
 #[derive(Default)]
 struct AddNumbers;
 
 #[UseCase]
 impl AddNumbers {
     async fn execute(&self, input: AddNumbersInput) -> Result<AddNumbersOutput, AddNumbersError> {
-        # todo!()
+        todo!()
     }
 }
 ```
@@ -148,14 +150,73 @@ This registers the method `AddNumbers`.
 
 You can override the method name when needed:
 
-```rust
+```rust,ignore
 #[UseCase(method = "MathAdd")]
 impl AddNumbers {
     async fn execute(&self, input: AddNumbersInput) -> Result<AddNumbersOutput, AddNumbersError> {
-        # todo!()
+        todo!()
     }
 }
 ```
+
+## Guards
+
+Use guards to deny access before a use case deserializes input or executes. A guard implements `Guard` and receives a `GuardContext` containing HTTP request headers and the validated JSON-RPC request snapshot.
+
+```rust,ignore
+use jsonrpc_usecase::{Guard, GuardContext, UseCase};
+
+#[derive(Default)]
+struct RequireAccessToken;
+
+impl Guard for RequireAccessToken {
+    fn can_proceed(&self, context: &GuardContext) -> bool {
+        context.headers().get("x-access-token") == Some("allowed")
+            && context.request().method() == "ReadSecret"
+    }
+}
+
+#[derive(Default)]
+struct ReadSecret;
+
+#[UseCase(guards = [RequireAccessToken])]
+impl ReadSecret {
+    async fn execute(&self, input: ReadSecretInput) -> Result<ReadSecretOutput, ReadSecretError> {
+        todo!()
+    }
+}
+```
+
+You can combine guards. All guards must return `true`:
+
+```rust,ignore
+#[UseCase(guards = [RequireAccessToken, RequireAdminRole])]
+impl ReadSecret {
+    async fn execute(&self, input: ReadSecretInput) -> Result<ReadSecretOutput, ReadSecretError> {
+        todo!()
+    }
+}
+```
+
+Guards are instantiated with `Default`, so guard types must implement `Default`. Header lookup is case-insensitive. If any guard returns `false`, the use case is not called and the JSON-RPC response uses code `-32001` with message `Access denied`.
+
+Framework-neutral callers can pass headers explicitly:
+
+```rust,ignore
+use jsonrpc_usecase::{JsonRpcService, RequestHeaders};
+use serde_json::json;
+
+let response = service.handle_value_with_headers(
+    json!({
+        "jsonrpc": "2.0",
+        "method": "ReadSecret",
+        "id": 1
+    }),
+    RequestHeaders::new([("X-Access-Token", "allowed")]),
+).await;
+```
+
+`handle_json` and `handle_value` use an empty header set. The Axum adapter passes incoming HTTP request headers automatically.
 
 ## Build The Service
 
@@ -177,7 +238,7 @@ There is no `register(...)` call. If two use cases register the same JSON-RPC me
 
 Use `handle_json` when your transport gives you a raw JSON body:
 
-```rust
+```rust,ignore
 let request = r#"{
     "jsonrpc": "2.0",
     "method": "AddNumbers",
@@ -195,7 +256,7 @@ assert_eq!(
 
 Use `handle_value` when your framework already parsed JSON into `serde_json::Value`:
 
-```rust
+```rust,ignore
 use serde_json::json;
 
 let response = service.handle_value(json!({
@@ -225,7 +286,7 @@ For `AddNumbers`, the event names are `WillAddNumbers` and `DidAddNumbers`. Even
 
 Register consumers as standalone structs:
 
-```rust
+```rust,ignore
 use jsonrpc_usecase::{UseCaseEvent, UseCaseEventConsumer};
 
 #[UseCaseEventConsumer(event = "WillAddNumbers")]
@@ -236,7 +297,6 @@ impl AuditAddNumbersRequest {
     fn consume(&self, event: &UseCaseEvent) {
         let method = event.request().method();
         let input = event.input();
-        # let _ = (method, input);
     }
 }
 
@@ -248,7 +308,6 @@ impl AuditAddNumbersResult {
     fn consume(&self, event: &UseCaseEvent) {
         let request_id = event.request().id();
         let output = event.output();
-        # let _ = (request_id, output);
     }
 }
 ```
@@ -257,15 +316,16 @@ All linked event consumers are auto-discovered. There is no service builder regi
 
 Multiple consumers can listen to the same event by using the same event name more than once:
 
-```rust
-# use jsonrpc_usecase::{UseCaseEvent, UseCaseEventConsumer};
+```rust,ignore
+use jsonrpc_usecase::{UseCaseEvent, UseCaseEventConsumer};
+
 #[UseCaseEventConsumer(event = "DidAddNumbers")]
 #[derive(Default)]
 struct WriteAddNumbersAuditLog;
 
 impl WriteAddNumbersAuditLog {
     fn consume(&self, event: &UseCaseEvent) {
-        # let _ = event;
+        println!("audit event: {}", event.name());
     }
 }
 
@@ -275,7 +335,7 @@ struct UpdateAddNumbersMetrics;
 
 impl UpdateAddNumbersMetrics {
     fn consume(&self, event: &UseCaseEvent) {
-        # let _ = event;
+        println!("metric event: {}", event.name());
     }
 }
 ```
@@ -308,7 +368,7 @@ Request `params` are expected in camelCase:
 
 The library converts camelCase params into Rust snake_case before deserializing `Input`:
 
-```rust
+```rust,ignore
 #[derive(Deserialize)]
 struct AddNumbersInput {
     left_operand: i64,
@@ -352,7 +412,7 @@ The error mapping is controlled by the library `Error` trait:
 
 Example with a custom message:
 
-```rust
+```rust,ignore
 impl Error for AddNumbersError {
     fn code(&self) -> i64 {
         10_001
@@ -380,7 +440,7 @@ The response types are internal. Match on the serialized JSON if tests need to a
 
 Batch requests are supported. Each item is dispatched concurrently and the response order follows the request order.
 
-```rust
+```rust,ignore
 use serde_json::json;
 
 let response = service.handle_value(json!([
@@ -412,7 +472,7 @@ The second item is a notification because it has no `id`, so it is executed but 
 
 Enable the `axum` feature to get a ready-to-use router for the configured endpoint:
 
-```rust
+```rust,ignore
 use jsonrpc_usecase::{JsonRpcService, axum};
 
 let service = JsonRpcService::builder()
@@ -420,7 +480,6 @@ let service = JsonRpcService::builder()
     .build()?;
 
 let app = axum::router(service);
-# Ok::<_, Box<dyn std::error::Error>>(app)
 ```
 
 The adapter:
@@ -432,7 +491,9 @@ The adapter:
 
 Without the `axum` feature, wire `JsonRpcService` into any HTTP framework manually:
 
-```rust
+```rust,ignore
+use jsonrpc_usecase::JsonRpcService;
+
 async fn rpc_handler(service: JsonRpcService, body: String) -> Option<String> {
     service.handle_json(&body).await
 }

@@ -85,6 +85,7 @@ impl JsonRpcErrorObject {
     pub(crate) const METHOD_NOT_FOUND: i64 = -32601;
     pub(crate) const INVALID_PARAMS: i64 = -32602;
     pub(crate) const INTERNAL_ERROR: i64 = -32603;
+    pub(crate) const ACCESS_DENIED: i64 = -32001;
 
     pub(crate) fn custom(code: i64, message: String, data: Option<Value>) -> Self {
         Self {
@@ -112,6 +113,10 @@ impl JsonRpcErrorObject {
 
     pub(crate) fn internal_error(data: Option<Value>) -> Self {
         Self::standard(Self::INTERNAL_ERROR, "Internal error", data)
+    }
+
+    pub(crate) fn access_denied(data: Option<Value>) -> Self {
+        Self::standard(Self::ACCESS_DENIED, "Access denied", data)
     }
 
     fn standard(code: i64, message: &str, data: Option<Value>) -> Self {

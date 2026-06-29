@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::{Error, GuardContext};
 use serde::{Serialize, de::DeserializeOwned};
 use std::future::Future;
 
@@ -9,6 +9,8 @@ pub trait UseCaseDefinition: Send + Sync + 'static {
 
     const WILL_EVENT: &'static str;
     const DID_EVENT: &'static str;
+
+    fn can_proceed(context: &GuardContext) -> bool;
 
     fn execute(
         &self,

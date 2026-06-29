@@ -1,5 +1,8 @@
 use futures::executor::block_on;
-use jsonrpc_usecase::{Error, JsonRpcService, UseCase, UseCaseEvent, UseCaseEventConsumer};
+use jsonrpc_usecase::{
+    Error, Guard, GuardContext, JsonRpcService, RequestHeaders, UseCase, UseCaseEvent,
+    UseCaseEventConsumer,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -47,6 +50,36 @@ impl std::error::Error for AddNumbersError {}
 impl Error for AddNumbersError {
     fn code(&self) -> i64 {
         10_001
+    }
+}
+
+#[derive(Default)]
+struct RequireAccessHeader;
+
+impl Guard for RequireAccessHeader {
+    fn can_proceed(&self, context: &GuardContext) -> bool {
+        context.request().method() == "GuardedEcho"
+            && context.headers().get("x-access-token") == Some("allowed")
+    }
+}
+
+#[derive(Default)]
+struct GuardedEcho;
+
+#[derive(Deserialize)]
+struct GuardedEchoInput {
+    value: String,
+}
+
+#[derive(Serialize)]
+struct GuardedEchoOutput {
+    value: String,
+}
+
+#[UseCase(guards = [RequireAccessHeader])]
+impl GuardedEcho {
+    async fn execute(&self, input: GuardedEchoInput) -> Result<GuardedEchoOutput, AddNumbersError> {
+        Ok(GuardedEchoOutput { value: input.value })
     }
 }
 
@@ -281,6 +314,47 @@ fn converts_use_case_error_to_jsonrpc_error_object() {
     assert_eq!(
         response["error"]["data"],
         json!({ "failureReason": "left must be positive" })
+    );
+}
+
+#[test]
+fn denies_guarded_use_case_when_guard_rejects_request() {
+    let response = block_on(service().handle_value(json!({
+        "jsonrpc": "2.0",
+        "method": "GuardedEcho",
+        "params": { "value": "secret" },
+        "id": "guarded"
+    })))
+    .unwrap();
+
+    assert_eq!(response["id"], "guarded");
+    assert_eq!(response["error"]["code"], -32001);
+    assert_eq!(response["error"]["message"], "Access denied");
+    assert_eq!(
+        response["error"]["data"],
+        json!({ "method": "GuardedEcho" })
+    );
+}
+
+#[test]
+fn allows_guarded_use_case_when_guard_accepts_headers_and_request() {
+    let response = block_on(service().handle_value_with_headers(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "GuardedEcho",
+            "params": { "value": "secret" },
+            "id": "guarded"
+        }),
+        RequestHeaders::new([("X-Access-Token", "allowed")]),
+    ));
+
+    assert_eq!(
+        response,
+        Some(json!({
+            "jsonrpc": "2.0",
+            "result": { "value": "secret" },
+            "id": "guarded"
+        }))
     );
 }
 

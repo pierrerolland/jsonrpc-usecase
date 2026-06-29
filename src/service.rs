@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     event::{self, EventRequest, UseCaseEvent},
+    guard::{GuardContext, RequestHeaders},
     method::MethodSuccess,
     registry::UseCaseRegistration,
     request::ValidRequest,
@@ -37,6 +38,15 @@ impl JsonRpcService {
     }
 
     pub async fn handle_json(&self, body: &str) -> Option<String> {
+        self.handle_json_with_headers(body, RequestHeaders::default())
+            .await
+    }
+
+    pub async fn handle_json_with_headers(
+        &self,
+        body: &str,
+        headers: RequestHeaders,
+    ) -> Option<String> {
         let value = match serde_json::from_str::<Value>(body) {
             Ok(value) => value,
             Err(error) => {
@@ -50,7 +60,7 @@ impl JsonRpcService {
             }
         };
 
-        let handled = self.handle_value_with_events(value).await;
+        let handled = self.handle_value_with_events(value, &headers).await;
         let response = handled.response.map(|value| {
             serde_json::to_string(&value).expect("JSON-RPC responses are serializable")
         });
@@ -59,13 +69,26 @@ impl JsonRpcService {
     }
 
     pub async fn handle_value(&self, value: Value) -> Option<Value> {
-        let handled = self.handle_value_with_events(value).await;
+        self.handle_value_with_headers(value, RequestHeaders::default())
+            .await
+    }
+
+    pub async fn handle_value_with_headers(
+        &self,
+        value: Value,
+        headers: RequestHeaders,
+    ) -> Option<Value> {
+        let handled = self.handle_value_with_events(value, &headers).await;
         let response = handled.response;
         publish_did_events(handled.did_events);
         response
     }
 
-    async fn handle_value_with_events(&self, value: Value) -> HandledValue {
+    async fn handle_value_with_events(
+        &self,
+        value: Value,
+        headers: &RequestHeaders,
+    ) -> HandledValue {
         match value {
             Value::Array(items) if items.is_empty() => HandledValue {
                 response: Some(
@@ -80,8 +103,12 @@ impl JsonRpcService {
                 did_events: Vec::new(),
             },
             Value::Array(items) => {
-                let handled_items =
-                    join_all(items.into_iter().map(|item| self.handle_single(item))).await;
+                let handled_items = join_all(
+                    items
+                        .into_iter()
+                        .map(|item| self.handle_single(item, headers)),
+                )
+                .await;
                 let mut responses = Vec::new();
                 let mut did_events = Vec::new();
 
@@ -107,7 +134,7 @@ impl JsonRpcService {
                 }
             }
             value => {
-                let handled = self.handle_single(value).await;
+                let handled = self.handle_single(value, headers).await;
                 HandledValue {
                     response: handled.response.map(Value::from),
                     did_events: handled.did_event.into_iter().collect(),
@@ -116,7 +143,7 @@ impl JsonRpcService {
         }
     }
 
-    async fn handle_single(&self, value: Value) -> HandledSingle {
+    async fn handle_single(&self, value: Value, headers: &RequestHeaders) -> HandledSingle {
         let request = match ValidRequest::try_from(value) {
             Ok(request) => request,
             Err(error) => {
@@ -128,7 +155,7 @@ impl JsonRpcService {
         };
 
         let id = request.id.clone();
-        let result = self.execute_request(request).await;
+        let result = self.execute_request(request, headers).await;
 
         match (id, result) {
             (Some(id), Ok(success)) => HandledSingle {
@@ -153,6 +180,7 @@ impl JsonRpcService {
     async fn execute_request(
         &self,
         request: ValidRequest,
+        headers: &RequestHeaders,
     ) -> Result<MethodSuccess, JsonRpcErrorObject> {
         let method_name = request.method.clone();
         let method = self.methods.get(&request.method).cloned().ok_or_else(|| {
@@ -162,9 +190,10 @@ impl JsonRpcService {
         })?;
 
         let event_request = EventRequest::from_valid_request(&request);
+        let context = GuardContext::new(headers.clone(), event_request);
         let params = request.params;
 
-        method.call(event_request, params).await
+        method.call(context, params).await
     }
 }
 
