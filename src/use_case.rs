@@ -7,6 +7,9 @@ pub trait UseCaseDefinition: Send + Sync + 'static {
     type Output: Serialize + Send + 'static;
     type Error: Error;
 
+    const WILL_EVENT: &'static str;
+    const DID_EVENT: &'static str;
+
     fn execute(
         &self,
         input: Self::Input,

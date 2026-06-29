@@ -1,4 +1,4 @@
-use crate::method::RpcMethod;
+use crate::{event::UseCaseEvent, method::RpcMethod};
 use std::sync::Arc;
 
 pub struct UseCaseRegistration {
@@ -7,3 +7,10 @@ pub struct UseCaseRegistration {
 }
 
 inventory::collect!(UseCaseRegistration);
+
+pub struct UseCaseEventConsumerRegistration {
+    pub event: &'static str,
+    pub consumer: fn(&UseCaseEvent),
+}
+
+inventory::collect!(UseCaseEventConsumerRegistration);

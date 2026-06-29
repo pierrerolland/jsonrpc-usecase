@@ -1,4 +1,9 @@
-use crate::{case, response::JsonRpcErrorObject, use_case::UseCaseDefinition};
+use crate::{
+    case,
+    event::{self, EventRequest, UseCaseEvent},
+    response::JsonRpcErrorObject,
+    use_case::UseCaseDefinition,
+};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{future::Future, pin::Pin};
@@ -6,8 +11,14 @@ use std::{future::Future, pin::Pin};
 pub trait RpcMethod: Send + Sync {
     fn call<'a>(
         &'a self,
+        request: EventRequest,
         params: Option<Value>,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, JsonRpcErrorObject>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<MethodSuccess, JsonRpcErrorObject>> + Send + 'a>>;
+}
+
+pub struct MethodSuccess {
+    pub(crate) output: Value,
+    pub(crate) did_event: UseCaseEvent,
 }
 
 pub struct UseCaseMethod<U> {
@@ -26,11 +37,19 @@ where
 {
     fn call<'a>(
         &'a self,
+        request: EventRequest,
         params: Option<Value>,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, JsonRpcErrorObject>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<MethodSuccess, JsonRpcErrorObject>> + Send + 'a>> {
         Box::pin(async move {
+            let event_request = request;
             let params = params.unwrap_or(Value::Null);
-            let input = deserialize_input::<U::Input>(params)?;
+            let (input, event_input) = deserialize_input::<U::Input>(params)?;
+
+            event::publish(&UseCaseEvent::will(
+                U::WILL_EVENT,
+                event_request.clone(),
+                event_input.clone(),
+            ));
 
             let output = self
                 .use_case
@@ -38,27 +57,34 @@ where
                 .await
                 .map_err(|error| JsonRpcErrorObject::from(&error))?;
 
-            serde_json::to_value(output)
+            let output = serde_json::to_value(&output)
                 .map(case::value_to_json_case)
                 .map_err(|error| {
                     JsonRpcErrorObject::internal_error(Some(json!({
                         "reason": error.to_string(),
                     })))
-                })
+                })?;
+
+            let did_event =
+                UseCaseEvent::did(U::DID_EVENT, event_request, event_input, output.clone());
+
+            Ok(MethodSuccess { output, did_event })
         })
     }
 }
 
-fn deserialize_input<T>(params: Value) -> Result<T, JsonRpcErrorObject>
+fn deserialize_input<T>(params: Value) -> Result<(T, Value), JsonRpcErrorObject>
 where
     T: DeserializeOwned,
 {
     let params = case::params_to_rust_case(params);
 
     match serde_json::from_value::<T>(params.clone()) {
-        Ok(input) => Ok(input),
+        Ok(input) => Ok((input, case::value_to_json_case(params))),
         Err(error) if matches!(params, Value::Array(ref items) if items.is_empty()) => {
-            serde_json::from_value::<T>(Value::Null).map_err(|_| invalid_params(error))
+            serde_json::from_value::<T>(Value::Null)
+                .map(|input| (input, Value::Null))
+                .map_err(|_| invalid_params(error))
         }
         Err(error) => Err(invalid_params(error)),
     }

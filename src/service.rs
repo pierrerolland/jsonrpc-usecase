@@ -1,5 +1,7 @@
 use crate::{
     config::Config,
+    event::{self, EventRequest, UseCaseEvent},
+    method::MethodSuccess,
     registry::UseCaseRegistration,
     request::ValidRequest,
     response::{JsonRpcErrorObject, JsonRpcResponse},
@@ -48,56 +50,110 @@ impl JsonRpcService {
             }
         };
 
-        self.handle_value(value).await.map(|value| {
+        let handled = self.handle_value_with_events(value).await;
+        let response = handled.response.map(|value| {
             serde_json::to_string(&value).expect("JSON-RPC responses are serializable")
-        })
+        });
+        publish_did_events(handled.did_events);
+        response
     }
 
     pub async fn handle_value(&self, value: Value) -> Option<Value> {
-        match value {
-            Value::Array(items) if items.is_empty() => Some(
-                JsonRpcResponse::error(
-                    Value::Null,
-                    JsonRpcErrorObject::invalid_request(Some(json!({
-                        "reason": "batch request must not be empty",
-                    }))),
-                )
-                .into(),
-            ),
-            Value::Array(items) => {
-                let responses = join_all(items.into_iter().map(|item| self.handle_single(item)))
-                    .await
-                    .into_iter()
-                    .flatten()
-                    .map(Value::from)
-                    .collect::<Vec<_>>();
+        let handled = self.handle_value_with_events(value).await;
+        let response = handled.response;
+        publish_did_events(handled.did_events);
+        response
+    }
 
-                if responses.is_empty() {
+    async fn handle_value_with_events(&self, value: Value) -> HandledValue {
+        match value {
+            Value::Array(items) if items.is_empty() => HandledValue {
+                response: Some(
+                    JsonRpcResponse::error(
+                        Value::Null,
+                        JsonRpcErrorObject::invalid_request(Some(json!({
+                            "reason": "batch request must not be empty",
+                        }))),
+                    )
+                    .into(),
+                ),
+                did_events: Vec::new(),
+            },
+            Value::Array(items) => {
+                let handled_items =
+                    join_all(items.into_iter().map(|item| self.handle_single(item))).await;
+                let mut responses = Vec::new();
+                let mut did_events = Vec::new();
+
+                for handled in handled_items {
+                    if let Some(response) = handled.response {
+                        responses.push(Value::from(response));
+                    }
+
+                    if let Some(did_event) = handled.did_event {
+                        did_events.push(did_event);
+                    }
+                }
+
+                let response = if responses.is_empty() {
                     None
                 } else {
                     Some(Value::Array(responses))
+                };
+
+                HandledValue {
+                    response,
+                    did_events,
                 }
             }
-            value => self.handle_single(value).await.map(Value::from),
+            value => {
+                let handled = self.handle_single(value).await;
+                HandledValue {
+                    response: handled.response.map(Value::from),
+                    did_events: handled.did_event.into_iter().collect(),
+                }
+            }
         }
     }
 
-    async fn handle_single(&self, value: Value) -> Option<JsonRpcResponse> {
+    async fn handle_single(&self, value: Value) -> HandledSingle {
         let request = match ValidRequest::try_from(value) {
             Ok(request) => request,
-            Err(error) => return Some(error.into()),
+            Err(error) => {
+                return HandledSingle {
+                    response: Some(error.into()),
+                    did_event: None,
+                };
+            }
         };
 
         let id = request.id.clone();
         let result = self.execute_request(request).await;
 
-        id.map(|id| match result {
-            Ok(result) => JsonRpcResponse::success(id, result),
-            Err(error) => JsonRpcResponse::error(id, error),
-        })
+        match (id, result) {
+            (Some(id), Ok(success)) => HandledSingle {
+                response: Some(JsonRpcResponse::success(id, success.output)),
+                did_event: Some(success.did_event),
+            },
+            (Some(id), Err(error)) => HandledSingle {
+                response: Some(JsonRpcResponse::error(id, error)),
+                did_event: None,
+            },
+            (None, Ok(success)) => HandledSingle {
+                response: None,
+                did_event: Some(success.did_event),
+            },
+            (None, Err(_)) => HandledSingle {
+                response: None,
+                did_event: None,
+            },
+        }
     }
 
-    async fn execute_request(&self, request: ValidRequest) -> Result<Value, JsonRpcErrorObject> {
+    async fn execute_request(
+        &self,
+        request: ValidRequest,
+    ) -> Result<MethodSuccess, JsonRpcErrorObject> {
         let method_name = request.method.clone();
         let method = self.methods.get(&request.method).cloned().ok_or_else(|| {
             JsonRpcErrorObject::method_not_found(Some(json!({
@@ -105,8 +161,21 @@ impl JsonRpcService {
             })))
         })?;
 
-        method.call(request.params).await
+        let event_request = EventRequest::from_valid_request(&request);
+        let params = request.params;
+
+        method.call(event_request, params).await
     }
+}
+
+struct HandledValue {
+    response: Option<Value>,
+    did_events: Vec<UseCaseEvent>,
+}
+
+struct HandledSingle {
+    response: Option<JsonRpcResponse>,
+    did_event: Option<UseCaseEvent>,
 }
 
 #[derive(Default)]
@@ -168,6 +237,12 @@ fn registered_methods() -> Result<MethodMap, RegistrationError> {
     }
 
     Ok(methods)
+}
+
+fn publish_did_events(events: Vec<UseCaseEvent>) {
+    for event in events {
+        event::publish_async(event);
+    }
 }
 
 fn serialize_response(response: &JsonRpcResponse) -> String {

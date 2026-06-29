@@ -1,8 +1,9 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
-    Expr, FnArg, GenericArgument, ImplItem, ImplItemFn, ItemImpl, Lit, LitStr, Meta, PatType,
-    PathArguments, ReturnType, Type, parse_macro_input, punctuated::Punctuated,
+    Expr, FnArg, GenericArgument, ImplItem, ImplItemFn, Item, ItemFn, ItemImpl, ItemStruct, Lit,
+    LitStr, Meta, PatType, PathArguments, ReturnType, Type, parse_macro_input,
+    punctuated::Punctuated,
 };
 
 #[allow(non_snake_case)]
@@ -12,6 +13,18 @@ pub fn UseCase(args: TokenStream, input: TokenStream) -> TokenStream {
     let item_impl = parse_macro_input!(input as ItemImpl);
 
     match expand_use_case(args, item_impl) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+#[allow(non_snake_case)]
+#[proc_macro_attribute]
+pub fn UseCaseEventConsumer(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args with Punctuated::<Meta, syn::Token![,]>::parse_terminated);
+    let item = parse_macro_input!(input as Item);
+
+    match expand_event_consumer(args, item) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -36,9 +49,17 @@ fn expand_use_case(
     }
 
     let self_ty = item_impl.self_ty.as_ref();
-    let default_method = pascal_case_method_name(self_ty)?;
-    let method = method_name_from_args(args)?.unwrap_or(default_method);
+    let use_case_name = use_case_name(self_ty)?;
+    let method = method_name_from_args(args)?.unwrap_or_else(|| use_case_name.clone());
     let method = LitStr::new(&method, proc_macro2::Span::call_site());
+    let will_event = LitStr::new(
+        &format!("Will{use_case_name}"),
+        proc_macro2::Span::call_site(),
+    );
+    let did_event = LitStr::new(
+        &format!("Did{use_case_name}"),
+        proc_macro2::Span::call_site(),
+    );
 
     let execute = execute_method(&item_impl)?;
     let input_ty = input_type(execute)?;
@@ -51,6 +72,9 @@ fn expand_use_case(
             type Input = #input_ty;
             type Output = #output_ty;
             type Error = #error_ty;
+
+            const WILL_EVENT: &'static str = #will_event;
+            const DID_EVENT: &'static str = #did_event;
 
             fn execute(
                 &self,
@@ -73,6 +97,127 @@ fn expand_use_case(
             }
         }
     })
+}
+
+fn expand_event_consumer(
+    args: Punctuated<Meta, syn::Token![,]>,
+    item: Item,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let event = event_name_from_args(args)?;
+
+    match item {
+        Item::Fn(item_fn) => expand_event_consumer_fn(event, item_fn),
+        Item::Struct(item_struct) => expand_event_consumer_struct(event, item_struct),
+        Item::Impl(item_impl) => expand_event_consumer_impl(event, item_impl),
+        item => Err(syn::Error::new_spanned(
+            item,
+            "UseCaseEventConsumer must be applied to a struct, function, or inherent impl block",
+        )),
+    }
+}
+
+fn expand_event_consumer_fn(
+    event: LitStr,
+    item_fn: ItemFn,
+) -> syn::Result<proc_macro2::TokenStream> {
+    validate_event_consumer_fn_signature(&item_fn)?;
+    let consumer = &item_fn.sig.ident;
+
+    Ok(event_consumer_registration(
+        event,
+        quote!(#item_fn),
+        quote!(#consumer),
+    ))
+}
+
+fn expand_event_consumer_struct(
+    event: LitStr,
+    item_struct: ItemStruct,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if !item_struct.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item_struct.generics,
+            "event consumers cannot be generic",
+        ));
+    }
+
+    let consumer = &item_struct.ident;
+    let trampoline = format_ident!("__jsonrpc_usecase_event_consumer_{}_consume", consumer);
+    let item = quote! {
+        #item_struct
+
+        #[allow(non_snake_case)]
+        fn #trampoline(event: &::jsonrpc_usecase::UseCaseEvent) {
+            <#consumer as ::std::default::Default>::default().consume(event)
+        }
+    };
+
+    Ok(event_consumer_registration(
+        event,
+        item,
+        quote!(#trampoline),
+    ))
+}
+
+fn expand_event_consumer_impl(
+    event: LitStr,
+    item_impl: ItemImpl,
+) -> syn::Result<proc_macro2::TokenStream> {
+    if item_impl.trait_.is_some() {
+        return Err(syn::Error::new_spanned(
+            item_impl.impl_token,
+            "UseCaseEventConsumer must be applied to an inherent impl block",
+        ));
+    }
+
+    if !item_impl.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item_impl.generics,
+            "event consumers cannot be generic",
+        ));
+    }
+
+    let self_ty = item_impl.self_ty.as_ref();
+    let consumer_name = use_case_name(self_ty)?;
+    let consume = consume_method(&item_impl)?;
+    validate_event_consumer_method_signature(consume)?;
+    let consume_ident = &consume.sig.ident;
+    let trampoline = format_ident!(
+        "__jsonrpc_usecase_event_consumer_{}_{}",
+        consumer_name,
+        consume_ident
+    );
+    let item = quote! {
+        #item_impl
+
+        #[allow(non_snake_case)]
+        fn #trampoline(event: &::jsonrpc_usecase::UseCaseEvent) {
+            <#self_ty as ::std::default::Default>::default().#consume_ident(event)
+        }
+    };
+
+    Ok(event_consumer_registration(
+        event,
+        item,
+        quote!(#trampoline),
+    ))
+}
+
+fn event_consumer_registration(
+    event: LitStr,
+    item: proc_macro2::TokenStream,
+    consumer: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        #item
+
+        ::jsonrpc_usecase::__private::inventory::submit! {
+            ::jsonrpc_usecase::__private::UseCaseEventConsumerRegistration {
+                event: #event,
+                consumer: #consumer,
+            }
+        }
+    }
 }
 
 fn method_name_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<Option<String>> {
@@ -113,6 +258,135 @@ fn method_name_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<
     }
 
     Ok(method)
+}
+
+fn event_name_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<LitStr> {
+    let mut event = None;
+
+    for arg in args {
+        match arg {
+            Meta::NameValue(name_value) if name_value.path.is_ident("event") => {
+                let Expr::Lit(expr_lit) = name_value.value else {
+                    return Err(syn::Error::new_spanned(
+                        name_value,
+                        "expected `event = \"EventName\"`",
+                    ));
+                };
+                let Lit::Str(literal) = expr_lit.lit else {
+                    return Err(syn::Error::new_spanned(
+                        expr_lit,
+                        "expected `event = \"EventName\"`",
+                    ));
+                };
+
+                if literal.value().is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        literal,
+                        "event name must not be empty",
+                    ));
+                }
+                event = Some(literal);
+            }
+            meta => {
+                return Err(syn::Error::new_spanned(
+                    meta,
+                    "expected `event = \"EventName\"`",
+                ));
+            }
+        }
+    }
+
+    event.ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "expected `event = \"EventName\"`",
+        )
+    })
+}
+
+fn validate_event_consumer_fn_signature(item_fn: &ItemFn) -> syn::Result<()> {
+    if !item_fn.sig.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.generics,
+            "event consumers cannot be generic",
+        ));
+    }
+
+    if item_fn.sig.asyncness.is_some() {
+        return Err(syn::Error::new_spanned(
+            item_fn.sig.asyncness,
+            "event consumers must be synchronous functions",
+        ));
+    }
+
+    if item_fn.sig.inputs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.inputs,
+            "event consumers must take exactly one `&UseCaseEvent` argument",
+        ));
+    }
+
+    match &item_fn.sig.output {
+        ReturnType::Default => Ok(()),
+        ReturnType::Type(..) => Err(syn::Error::new_spanned(
+            &item_fn.sig.output,
+            "event consumers must not return a value",
+        )),
+    }
+}
+
+fn consume_method(item_impl: &ItemImpl) -> syn::Result<&ImplItemFn> {
+    item_impl
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ImplItem::Fn(method) if method.sig.ident == "consume" => Some(method),
+            _ => None,
+        })
+        .next()
+        .ok_or_else(|| {
+            syn::Error::new_spanned(
+                item_impl,
+                "UseCaseEventConsumer requires a `consume(&self, event: &UseCaseEvent)` method",
+            )
+        })
+}
+
+fn validate_event_consumer_method_signature(method: &ImplItemFn) -> syn::Result<()> {
+    if method.sig.asyncness.is_some() {
+        return Err(syn::Error::new_spanned(
+            method.sig.asyncness,
+            "event consumers must be synchronous functions",
+        ));
+    }
+
+    if method.sig.inputs.len() != 2 {
+        return Err(syn::Error::new_spanned(
+            &method.sig.inputs,
+            "consume must take exactly `&self` and one `&UseCaseEvent` argument",
+        ));
+    }
+
+    let mut inputs = method.sig.inputs.iter();
+    let receiver = inputs.next().expect("length checked above");
+    match receiver {
+        FnArg::Receiver(receiver)
+            if receiver.reference.is_some() && receiver.mutability.is_none() => {}
+        _ => {
+            return Err(syn::Error::new_spanned(
+                receiver,
+                "consume must take `&self` as its first argument",
+            ));
+        }
+    }
+
+    match &method.sig.output {
+        ReturnType::Default => Ok(()),
+        ReturnType::Type(..) => Err(syn::Error::new_spanned(
+            &method.sig.output,
+            "event consumers must not return a value",
+        )),
+    }
 }
 
 fn execute_method(item_impl: &ItemImpl) -> syn::Result<&ImplItemFn> {
@@ -221,7 +495,7 @@ fn result_output_types(method: &ImplItemFn) -> syn::Result<(Type, Type)> {
     Ok((output, error))
 }
 
-fn pascal_case_method_name(self_ty: &Type) -> syn::Result<String> {
+fn use_case_name(self_ty: &Type) -> syn::Result<String> {
     let Type::Path(type_path) = self_ty else {
         return Err(syn::Error::new_spanned(
             self_ty,

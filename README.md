@@ -28,9 +28,11 @@ use jsonrpc_usecase::prelude::*;
 Developer-facing items:
 
 - `UseCase`: attribute macro applied to an inherent `impl` block.
+- `UseCaseEventConsumer`: attribute macro applied to an event consumer struct, function, or impl block.
 - `Error`: trait implemented by application error types.
 - `JsonRpcService`: framework-neutral JSON-RPC handler.
 - `JsonRpcServiceBuilder`: builder returned by `JsonRpcService::builder()`.
+- `EventRequest` and `UseCaseEvent`: event payload types.
 - `RegistrationError`: returned when the auto-registration registry is invalid, for example duplicate method names.
 
 The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro support module are internal. Treat responses as JSON returned by `JsonRpcService`.
@@ -39,7 +41,7 @@ The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro supp
 
 ```toml
 [dependencies]
-jsonrpc-usecase = "0.1"
+jsonrpc-usecase = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
@@ -57,7 +59,7 @@ For the optional Axum adapter:
 
 ```toml
 [dependencies]
-jsonrpc-usecase = { version = "0.1", features = ["axum"] }
+jsonrpc-usecase = { version = "0.2", features = ["axum"] }
 ```
 
 ## Define A Use Case
@@ -211,6 +213,81 @@ assert_eq!(response, Some(json!({
 ```
 
 Both handlers return `Option` because JSON-RPC notifications do not produce a response. A request without an `id` is executed, but returns `None`.
+
+## Use-Case Events
+
+Every `#[UseCase]` impl publishes two named events around successful use-case execution:
+
+- `Will<UseCaseName>` after the JSON-RPC params have been validated and deserialized, immediately before `execute`.
+- `Did<UseCaseName>` after `execute` returns `Ok(output)` and the output has been serialized.
+
+For `AddNumbers`, the event names are `WillAddNumbers` and `DidAddNumbers`. Event names are based on the use-case struct name, even when the JSON-RPC method name is overridden with `#[UseCase(method = "...")]`.
+
+Register consumers as standalone structs:
+
+```rust
+use jsonrpc_usecase::{UseCaseEvent, UseCaseEventConsumer};
+
+#[UseCaseEventConsumer(event = "WillAddNumbers")]
+#[derive(Default)]
+struct AuditAddNumbersRequest;
+
+impl AuditAddNumbersRequest {
+    fn consume(&self, event: &UseCaseEvent) {
+        let method = event.request().method();
+        let input = event.input();
+        # let _ = (method, input);
+    }
+}
+
+#[UseCaseEventConsumer(event = "DidAddNumbers")]
+#[derive(Default)]
+struct AuditAddNumbersResult;
+
+impl AuditAddNumbersResult {
+    fn consume(&self, event: &UseCaseEvent) {
+        let request_id = event.request().id();
+        let output = event.output();
+        # let _ = (request_id, output);
+    }
+}
+```
+
+All linked event consumers are auto-discovered. There is no service builder registration step. Struct consumers must implement `Default` and have a `consume(&self, event: &UseCaseEvent)` method.
+
+Multiple consumers can listen to the same event by using the same event name more than once:
+
+```rust
+# use jsonrpc_usecase::{UseCaseEvent, UseCaseEventConsumer};
+#[UseCaseEventConsumer(event = "DidAddNumbers")]
+#[derive(Default)]
+struct WriteAddNumbersAuditLog;
+
+impl WriteAddNumbersAuditLog {
+    fn consume(&self, event: &UseCaseEvent) {
+        # let _ = event;
+    }
+}
+
+#[UseCaseEventConsumer(event = "DidAddNumbers")]
+#[derive(Default)]
+struct UpdateAddNumbersMetrics;
+
+impl UpdateAddNumbersMetrics {
+    fn consume(&self, event: &UseCaseEvent) {
+        # let _ = event;
+    }
+}
+```
+
+`UseCaseEvent` exposes:
+
+- `name()`: the event name.
+- `request()`: the JSON-RPC request snapshot, including `jsonrpc`, `method`, optional `params`, and optional `id`.
+- `input()`: the normalized use-case input payload as `serde_json::Value`.
+- `output()`: `None` for `Will*` events and `Some(value)` for `Did*` events.
+
+Event payload values use the same JSON casing as JSON-RPC requests and responses. `Will*` consumers run synchronously before the use case executes. `Did*` consumers are scheduled after the JSON-RPC response value or string has been constructed and run on a detached temporary thread, so they do not delay the response path. Protocol validation failures and invalid params publish no use-case events. Use-case errors publish `Will*`, but not `Did*`.
 
 ## JSON Field Case
 

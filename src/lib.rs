@@ -3,6 +3,7 @@ extern crate self as jsonrpc_usecase;
 mod case;
 mod config;
 mod error;
+mod event;
 mod method;
 mod registry;
 mod request;
@@ -14,7 +15,8 @@ mod use_case;
 pub mod axum;
 
 pub use error::Error;
-pub use jsonrpc_usecase_macros::UseCase;
+pub use event::{EventRequest, UseCaseEvent};
+pub use jsonrpc_usecase_macros::{UseCase, UseCaseEventConsumer};
 pub use service::{JsonRpcService, JsonRpcServiceBuilder, RegistrationError};
 
 pub(crate) const JSONRPC_VERSION: &str = "2.0";
@@ -23,12 +25,14 @@ pub(crate) const JSONRPC_VERSION: &str = "2.0";
 pub mod __private {
     pub use crate::{
         method::{RpcMethod, UseCaseMethod},
-        registry::UseCaseRegistration,
+        registry::{UseCaseEventConsumerRegistration, UseCaseRegistration},
         use_case::UseCaseDefinition,
     };
     pub use inventory;
 }
 
 pub mod prelude {
-    pub use crate::{Error, JsonRpcService, UseCase};
+    pub use crate::{
+        Error, EventRequest, JsonRpcService, UseCase, UseCaseEvent, UseCaseEventConsumer,
+    };
 }
