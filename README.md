@@ -43,7 +43,7 @@ The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro supp
 
 ```toml
 [dependencies]
-jsonrpc-usecase = "0.3"
+jsonrpc-usecase = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
@@ -61,7 +61,7 @@ For the optional Axum adapter:
 
 ```toml
 [dependencies]
-jsonrpc-usecase = { version = "0.3", features = ["axum"] }
+jsonrpc-usecase = { version = "0.4", features = ["axum"] }
 ```
 
 ## Define A Use Case
@@ -294,9 +294,11 @@ use jsonrpc_usecase::{UseCaseEvent, UseCaseEventConsumer};
 struct AuditAddNumbersRequest;
 
 impl AuditAddNumbersRequest {
-    fn consume(&self, event: &UseCaseEvent) {
+    async fn consume(&self, event: &UseCaseEvent) {
         let method = event.request().method();
-        let input = event.input();
+        let input = event
+            .get_input::<AddNumbersInput>()
+            .expect("WillAddNumbers carries AddNumbersInput");
     }
 }
 
@@ -305,14 +307,16 @@ impl AuditAddNumbersRequest {
 struct AuditAddNumbersResult;
 
 impl AuditAddNumbersResult {
-    fn consume(&self, event: &UseCaseEvent) {
+    async fn consume(&self, event: &UseCaseEvent) {
         let request_id = event.request().id();
-        let output = event.output();
+        let output = event
+            .get_output::<AddNumbersOutput>()
+            .expect("DidAddNumbers carries AddNumbersOutput");
     }
 }
 ```
 
-All linked event consumers are auto-discovered. There is no service builder registration step. Struct consumers must implement `Default` and have a `consume(&self, event: &UseCaseEvent)` method.
+All linked event consumers are auto-discovered. There is no service builder registration step. Struct consumers must implement `Default` and have an async `consume(&self, event: &UseCaseEvent)` method.
 
 Multiple consumers can listen to the same event by using the same event name more than once:
 
@@ -324,7 +328,7 @@ use jsonrpc_usecase::{UseCaseEvent, UseCaseEventConsumer};
 struct WriteAddNumbersAuditLog;
 
 impl WriteAddNumbersAuditLog {
-    fn consume(&self, event: &UseCaseEvent) {
+    async fn consume(&self, event: &UseCaseEvent) {
         println!("audit event: {}", event.name());
     }
 }
@@ -334,7 +338,7 @@ impl WriteAddNumbersAuditLog {
 struct UpdateAddNumbersMetrics;
 
 impl UpdateAddNumbersMetrics {
-    fn consume(&self, event: &UseCaseEvent) {
+    async fn consume(&self, event: &UseCaseEvent) {
         println!("metric event: {}", event.name());
     }
 }
@@ -346,8 +350,10 @@ impl UpdateAddNumbersMetrics {
 - `request()`: the JSON-RPC request snapshot, including `jsonrpc`, `method`, optional `params`, and optional `id`.
 - `input()`: the normalized use-case input payload as `serde_json::Value`.
 - `output()`: `None` for `Will*` events and `Some(value)` for `Did*` events.
+- `get_input::<T>()`: the typed input payload when `T` is the use-case input type.
+- `get_output::<T>()`: the typed output payload for `Did*` events when `T` is the use-case output type.
 
-Event payload values use the same JSON casing as JSON-RPC requests and responses. `Will*` consumers run synchronously before the use case executes. `Did*` consumers are scheduled after the JSON-RPC response value or string has been constructed and run on a detached temporary thread, so they do not delay the response path. Protocol validation failures and invalid params publish no use-case events. Use-case errors publish `Will*`, but not `Did*`.
+Raw event payload values use the same JSON casing as JSON-RPC requests and responses. Typed payload getters return the concrete Rust input and output values from the use case, without going through `serde_json::Value`. `Will*` consumers are awaited before the use case executes. `Did*` consumers are scheduled after the JSON-RPC response value or string has been constructed and run on a shared background Tokio runtime, so async consumers do not need to create their own runtime and do not delay the response path. Protocol validation failures and invalid params publish no use-case events. Use-case errors publish `Will*`, but not `Did*`.
 
 ## JSON Field Case
 

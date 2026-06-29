@@ -131,11 +131,24 @@ fn expand_event_consumer_fn(
 ) -> syn::Result<proc_macro2::TokenStream> {
     validate_event_consumer_fn_signature(&item_fn)?;
     let consumer = &item_fn.sig.ident;
+    let trampoline = format_ident!("__jsonrpc_usecase_event_consumer_{}", consumer);
+    let item = quote! {
+        #item_fn
+
+        #[allow(non_snake_case)]
+        fn #trampoline<'a>(
+            event: &'a ::jsonrpc_usecase::UseCaseEvent,
+        ) -> ::jsonrpc_usecase::__private::UseCaseEventConsumerFuture<'a> {
+            ::std::boxed::Box::pin(async move {
+                #consumer(event).await
+            })
+        }
+    };
 
     Ok(event_consumer_registration(
         event,
-        quote!(#item_fn),
-        quote!(#consumer),
+        item,
+        quote!(#trampoline),
     ))
 }
 
@@ -156,8 +169,12 @@ fn expand_event_consumer_struct(
         #item_struct
 
         #[allow(non_snake_case)]
-        fn #trampoline(event: &::jsonrpc_usecase::UseCaseEvent) {
-            <#consumer as ::std::default::Default>::default().consume(event)
+        fn #trampoline<'a>(
+            event: &'a ::jsonrpc_usecase::UseCaseEvent,
+        ) -> ::jsonrpc_usecase::__private::UseCaseEventConsumerFuture<'a> {
+            ::std::boxed::Box::pin(async move {
+                <#consumer as ::std::default::Default>::default().consume(event).await
+            })
         }
     };
 
@@ -200,8 +217,12 @@ fn expand_event_consumer_impl(
         #item_impl
 
         #[allow(non_snake_case)]
-        fn #trampoline(event: &::jsonrpc_usecase::UseCaseEvent) {
-            <#self_ty as ::std::default::Default>::default().#consume_ident(event)
+        fn #trampoline<'a>(
+            event: &'a ::jsonrpc_usecase::UseCaseEvent,
+        ) -> ::jsonrpc_usecase::__private::UseCaseEventConsumerFuture<'a> {
+            ::std::boxed::Box::pin(async move {
+                <#self_ty as ::std::default::Default>::default().#consume_ident(event).await
+            })
         }
     };
 
@@ -346,10 +367,10 @@ fn validate_event_consumer_fn_signature(item_fn: &ItemFn) -> syn::Result<()> {
         ));
     }
 
-    if item_fn.sig.asyncness.is_some() {
+    if item_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
-            item_fn.sig.asyncness,
-            "event consumers must be synchronous functions",
+            item_fn.sig.fn_token,
+            "event consumers must be async functions",
         ));
     }
 
@@ -387,10 +408,10 @@ fn consume_method(item_impl: &ItemImpl) -> syn::Result<&ImplItemFn> {
 }
 
 fn validate_event_consumer_method_signature(method: &ImplItemFn) -> syn::Result<()> {
-    if method.sig.asyncness.is_some() {
+    if method.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
-            method.sig.asyncness,
-            "event consumers must be synchronous functions",
+            method.sig.fn_token,
+            "event consumers must be async functions",
         ));
     }
 

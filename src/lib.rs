@@ -28,7 +28,9 @@ pub mod __private {
     pub use crate::{
         guard::{Guard, GuardContext},
         method::{RpcMethod, UseCaseMethod},
-        registry::{UseCaseEventConsumerRegistration, UseCaseRegistration},
+        registry::{
+            UseCaseEventConsumerFuture, UseCaseEventConsumerRegistration, UseCaseRegistration,
+        },
         use_case::UseCaseDefinition,
     };
     pub use inventory;

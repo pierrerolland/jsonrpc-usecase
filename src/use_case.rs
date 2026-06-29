@@ -3,8 +3,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::future::Future;
 
 pub trait UseCaseDefinition: Send + Sync + 'static {
-    type Input: DeserializeOwned + Send + 'static;
-    type Output: Serialize + Send + 'static;
+    type Input: DeserializeOwned + Send + Sync + 'static;
+    type Output: Serialize + Send + Sync + 'static;
     type Error: Error;
 
     const WILL_EVENT: &'static str;

@@ -19,6 +19,7 @@ static OBSERVED_EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 static FIRST_DID_CONSUMER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECOND_DID_CONSUMER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DID_CONSUMER_THREAD_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static TYPED_DID_OUTPUTS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
 
 #[derive(Default)]
 struct AddNumbers;
@@ -103,7 +104,7 @@ impl AddNumbers {
 struct RememberWillAddNumbers;
 
 impl RememberWillAddNumbers {
-    fn consume(&self, event: &UseCaseEvent) {
+    async fn consume(&self, event: &UseCaseEvent) {
         if !request_id_is(event, "event-payload-test") {
             return;
         }
@@ -117,6 +118,10 @@ impl RememberWillAddNumbers {
                 "id": event.request().id().cloned(),
             },
             "input": event.input().clone(),
+            "typedInput": {
+                "leftOperand": event.get_input::<AddNumbersInput>().unwrap().left_operand,
+                "rightOperand": event.get_input::<AddNumbersInput>().unwrap().right_operand,
+            },
             "output": event.output().cloned(),
         }));
     }
@@ -127,7 +132,9 @@ impl RememberWillAddNumbers {
 struct RememberDidAddNumbers;
 
 impl RememberDidAddNumbers {
-    fn consume(&self, event: &UseCaseEvent) {
+    async fn consume(&self, event: &UseCaseEvent) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
         if request_id_is(event, "event-payload-test") {
             DID_CONSUMER_THREAD_IDS
                 .lock()
@@ -142,12 +149,24 @@ impl RememberDidAddNumbers {
                     "id": event.request().id().cloned(),
                 },
                 "input": event.input().clone(),
+                "typedInput": {
+                    "leftOperand": event.get_input::<AddNumbersInput>().unwrap().left_operand,
+                    "rightOperand": event.get_input::<AddNumbersInput>().unwrap().right_operand,
+                },
                 "output": event.output().cloned(),
+                "typedOutput": event.get_output::<AddNumbersOutput>().unwrap().computed_sum,
             }));
         }
 
         if request_id_is(event, "multi-consumer-test") {
             FIRST_DID_CONSUMER_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        if request_id_is(event, "typed-output-test") {
+            TYPED_DID_OUTPUTS
+                .lock()
+                .unwrap()
+                .push(event.get_output::<AddNumbersOutput>().unwrap().computed_sum);
         }
     }
 }
@@ -157,7 +176,7 @@ impl RememberDidAddNumbers {
 struct CountDidAddNumbers;
 
 impl CountDidAddNumbers {
-    fn consume(&self, event: &UseCaseEvent) {
+    async fn consume(&self, event: &UseCaseEvent) {
         if request_id_is(event, "multi-consumer-test") {
             SECOND_DID_CONSUMER_CALLS.fetch_add(1, Ordering::SeqCst);
         }
@@ -254,6 +273,7 @@ fn publishes_will_and_did_use_case_events() {
                     "id": "event-payload-test",
                 },
                 "input": { "leftOperand": 2, "rightOperand": 3 },
+                "typedInput": { "leftOperand": 2, "rightOperand": 3 },
                 "output": null,
             }),
             json!({
@@ -265,7 +285,9 @@ fn publishes_will_and_did_use_case_events() {
                     "id": "event-payload-test",
                 },
                 "input": { "leftOperand": 2, "rightOperand": 3 },
+                "typedInput": { "leftOperand": 2, "rightOperand": 3 },
                 "output": { "computedSum": 5 },
+                "typedOutput": 5,
             }),
         ]
     );
@@ -276,6 +298,21 @@ fn publishes_will_and_did_use_case_events() {
             .iter()
             .all(|thread_id| thread_id != &request_thread_id)
     );
+}
+
+#[test]
+fn event_consumers_can_read_typed_output() {
+    TYPED_DID_OUTPUTS.lock().unwrap().clear();
+
+    block_on(service().handle_value(json!({
+        "jsonrpc": "2.0",
+        "method": "AddNumbers",
+        "params": { "leftOperand": 8, "rightOperand": 13 },
+        "id": "typed-output-test"
+    })));
+
+    wait_until(|| TYPED_DID_OUTPUTS.lock().unwrap().as_slice() == [21]);
+    assert_eq!(TYPED_DID_OUTPUTS.lock().unwrap().as_slice(), [21]);
 }
 
 #[test]
