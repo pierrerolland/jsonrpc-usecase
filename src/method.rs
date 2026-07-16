@@ -1,5 +1,6 @@
 use crate::{
     case,
+    context::RequestContext,
     event::{self, UseCaseEvent},
     guard::GuardContext,
     response::JsonRpcErrorObject,
@@ -49,6 +50,7 @@ where
             }
 
             let event_request = context.request().clone();
+            let request_context: RequestContext = context.context().clone();
             let params = params.unwrap_or(Value::Null);
             let DeserializedInput {
                 input,
@@ -60,6 +62,7 @@ where
             event::publish(&UseCaseEvent::will_typed(
                 U::WILL_EVENT,
                 event_request.clone(),
+                request_context.clone(),
                 event_input.clone(),
                 Arc::clone(&will_event_input),
             ))
@@ -82,6 +85,7 @@ where
             let did_event = UseCaseEvent::did_typed(
                 U::DID_EVENT,
                 event_request,
+                request_context,
                 event_input,
                 output.clone(),
                 did_event_input,

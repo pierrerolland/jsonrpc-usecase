@@ -1,7 +1,7 @@
 use futures::executor::block_on;
 use jsonrpc_usecase::{
     Error, Guard, GuardContext, JsonRpcService, RequestHeaders, UseCase, UseCaseEvent,
-    UseCaseEventConsumer,
+    UseCaseEventConsumer, current_context,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +20,8 @@ static FIRST_DID_CONSUMER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SECOND_DID_CONSUMER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DID_CONSUMER_THREAD_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static TYPED_DID_OUTPUTS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+static OBSERVED_CONTEXT_EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+static CONTEXT_BUILDER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 struct AddNumbers;
@@ -96,6 +98,57 @@ impl AddNumbers {
         Ok(AddNumbersOutput {
             computed_sum: input.left_operand + input.right_operand,
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CallerContext {
+    user_id: String,
+    role: String,
+    trace_id: String,
+}
+
+#[derive(Default)]
+struct DescribeCaller;
+
+#[derive(Serialize)]
+struct DescribeCallerOutput {
+    user_id: String,
+    role: String,
+    trace_id: String,
+}
+
+#[UseCase]
+impl DescribeCaller {
+    async fn execute(&self, _input: ()) -> Result<DescribeCallerOutput, AddNumbersError> {
+        let context = current_context::<CallerContext>().expect("caller context should be present");
+
+        Ok(DescribeCallerOutput {
+            user_id: context.user_id.clone(),
+            role: context.role.clone(),
+            trace_id: context.trace_id.clone(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct RequireAdminContext;
+
+impl Guard for RequireAdminContext {
+    fn can_proceed(&self, context: &GuardContext) -> bool {
+        context
+            .get_context::<CallerContext>()
+            .is_some_and(|caller| caller.role == "admin")
+    }
+}
+
+#[derive(Default)]
+struct AdminEcho;
+
+#[UseCase(guards = [RequireAdminContext])]
+impl AdminEcho {
+    async fn execute(&self, input: GuardedEchoInput) -> Result<GuardedEchoOutput, AddNumbersError> {
+        Ok(GuardedEchoOutput { value: input.value })
     }
 }
 
@@ -183,6 +236,31 @@ impl CountDidAddNumbers {
     }
 }
 
+#[UseCaseEventConsumer(event = "DidDescribeCaller")]
+#[derive(Default)]
+struct RememberDidDescribeCaller;
+
+impl RememberDidDescribeCaller {
+    async fn consume(&self, event: &UseCaseEvent) {
+        if !request_id_is(event, "context-event-test") {
+            return;
+        }
+
+        let context = event
+            .get_context::<CallerContext>()
+            .expect("event should carry caller context");
+        let scoped_context =
+            current_context::<CallerContext>().expect("event consumer should be context-scoped");
+
+        OBSERVED_CONTEXT_EVENTS.lock().unwrap().push(json!({
+            "userId": context.user_id.as_str(),
+            "role": context.role.as_str(),
+            "traceId": context.trace_id.as_str(),
+            "scopedUserId": scoped_context.user_id.as_str(),
+        }));
+    }
+}
+
 fn request_id_is(event: &UseCaseEvent, expected: &str) -> bool {
     matches!(event.request().id(), Some(Value::String(id)) if id == expected)
 }
@@ -216,6 +294,30 @@ impl Ping {
 fn service() -> JsonRpcService {
     JsonRpcService::builder()
         .endpoint("/api/rpc")
+        .build()
+        .unwrap()
+}
+
+fn context_service() -> JsonRpcService {
+    JsonRpcService::builder()
+        .endpoint("/api/rpc")
+        .context_builder(|request| CallerContext {
+            user_id: request
+                .headers()
+                .get("x-user-id")
+                .unwrap_or("anonymous")
+                .to_owned(),
+            role: request
+                .headers()
+                .get("x-role")
+                .unwrap_or("guest")
+                .to_owned(),
+            trace_id: request
+                .headers()
+                .get("x-trace-id")
+                .unwrap_or("missing")
+                .to_owned(),
+        })
         .build()
         .unwrap()
 }
@@ -391,6 +493,234 @@ fn allows_guarded_use_case_when_guard_accepts_headers_and_request() {
             "jsonrpc": "2.0",
             "result": { "value": "secret" },
             "id": "guarded"
+        }))
+    );
+}
+
+#[test]
+fn use_cases_can_read_context_built_from_headers() {
+    let response = block_on(context_service().handle_value_with_headers(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "DescribeCaller",
+            "params": [],
+            "id": "caller"
+        }),
+        RequestHeaders::new([
+            ("X-User-Id", "user-123"),
+            ("X-Role", "member"),
+            ("X-Trace-Id", "trace-abc"),
+        ]),
+    ));
+
+    assert_eq!(
+        response,
+        Some(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "userId": "user-123",
+                "role": "member",
+                "traceId": "trace-abc",
+            },
+            "id": "caller"
+        }))
+    );
+}
+
+#[test]
+fn guards_can_read_context_built_from_headers() {
+    let denied = block_on(context_service().handle_value_with_headers(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "AdminEcho",
+            "params": { "value": "secret" },
+            "id": "admin-denied"
+        }),
+        RequestHeaders::new([("X-Role", "member")]),
+    ))
+    .unwrap();
+
+    assert_eq!(denied["error"]["code"], -32001);
+    assert_eq!(denied["error"]["message"], "Access denied");
+
+    let allowed = block_on(context_service().handle_value_with_headers(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "AdminEcho",
+            "params": { "value": "secret" },
+            "id": "admin-allowed"
+        }),
+        RequestHeaders::new([("X-Role", "admin")]),
+    ));
+
+    assert_eq!(
+        allowed,
+        Some(json!({
+            "jsonrpc": "2.0",
+            "result": { "value": "secret" },
+            "id": "admin-allowed"
+        }))
+    );
+}
+
+#[test]
+fn event_consumers_can_read_context() {
+    OBSERVED_CONTEXT_EVENTS.lock().unwrap().clear();
+
+    block_on(context_service().handle_value_with_headers(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "DescribeCaller",
+            "params": [],
+            "id": "context-event-test"
+        }),
+        RequestHeaders::new([
+            ("X-User-Id", "event-user"),
+            ("X-Role", "auditor"),
+            ("X-Trace-Id", "event-trace"),
+        ]),
+    ));
+
+    wait_until(|| OBSERVED_CONTEXT_EVENTS.lock().unwrap().len() == 1);
+    assert_eq!(
+        OBSERVED_CONTEXT_EVENTS.lock().unwrap().as_slice(),
+        [json!({
+            "userId": "event-user",
+            "role": "auditor",
+            "traceId": "event-trace",
+            "scopedUserId": "event-user",
+        })]
+    );
+}
+
+#[test]
+fn context_builder_runs_once_per_http_request() {
+    CONTEXT_BUILDER_CALLS.store(0, Ordering::SeqCst);
+
+    let service = JsonRpcService::builder()
+        .endpoint("/api/rpc")
+        .context_builder(|request| {
+            CONTEXT_BUILDER_CALLS.fetch_add(1, Ordering::SeqCst);
+
+            CallerContext {
+                user_id: request
+                    .headers()
+                    .get("x-user-id")
+                    .unwrap_or("anonymous")
+                    .to_owned(),
+                role: request
+                    .headers()
+                    .get("x-role")
+                    .unwrap_or("guest")
+                    .to_owned(),
+                trace_id: request
+                    .headers()
+                    .get("x-trace-id")
+                    .unwrap_or("missing")
+                    .to_owned(),
+            }
+        })
+        .build()
+        .unwrap();
+
+    let response = block_on(service.handle_value_with_headers(
+        json!([
+            {
+                "jsonrpc": "2.0",
+                "method": "DescribeCaller",
+                "params": [],
+                "id": "first-context"
+            },
+            {
+                "jsonrpc": "2.0",
+                "method": "DescribeCaller",
+                "params": [],
+                "id": "second-context"
+            }
+        ]),
+        RequestHeaders::new([
+            ("X-User-Id", "batch-user"),
+            ("X-Role", "member"),
+            ("X-Trace-Id", "batch-trace"),
+        ]),
+    ));
+
+    assert_eq!(CONTEXT_BUILDER_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        response,
+        Some(json!([
+            {
+                "jsonrpc": "2.0",
+                "result": {
+                    "userId": "batch-user",
+                    "role": "member",
+                    "traceId": "batch-trace",
+                },
+                "id": "first-context"
+            },
+            {
+                "jsonrpc": "2.0",
+                "result": {
+                    "userId": "batch-user",
+                    "role": "member",
+                    "traceId": "batch-trace",
+                },
+                "id": "second-context"
+            }
+        ]))
+    );
+}
+
+#[test]
+fn async_context_builder_can_build_context() {
+    let service = JsonRpcService::builder()
+        .endpoint("/api/rpc")
+        .async_context_builder(|request| async move {
+            CallerContext {
+                user_id: request
+                    .headers()
+                    .get("x-user-id")
+                    .unwrap_or("anonymous")
+                    .to_owned(),
+                role: request
+                    .headers()
+                    .get("x-role")
+                    .unwrap_or("guest")
+                    .to_owned(),
+                trace_id: request
+                    .headers()
+                    .get("x-trace-id")
+                    .unwrap_or("missing")
+                    .to_owned(),
+            }
+        })
+        .build()
+        .unwrap();
+
+    let response = block_on(service.handle_value_with_headers(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "DescribeCaller",
+            "params": [],
+            "id": "async-context"
+        }),
+        RequestHeaders::new([
+            ("X-User-Id", "async-user"),
+            ("X-Role", "member"),
+            ("X-Trace-Id", "async-trace"),
+        ]),
+    ));
+
+    assert_eq!(
+        response,
+        Some(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "userId": "async-user",
+                "role": "member",
+                "traceId": "async-trace",
+            },
+            "id": "async-context"
         }))
     );
 }

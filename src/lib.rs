@@ -2,6 +2,7 @@ extern crate self as jsonrpc_usecase;
 
 mod case;
 mod config;
+mod context;
 mod error;
 mod event;
 mod guard;
@@ -15,6 +16,7 @@ mod use_case;
 #[cfg(feature = "axum")]
 pub mod axum;
 
+pub use context::{ContextBuilderRequest, RequestContext, current_context, with_current_context};
 pub use error::Error;
 pub use event::{EventRequest, UseCaseEvent};
 pub use guard::{Guard, GuardContext, RequestHeader, RequestHeaders};
@@ -38,7 +40,8 @@ pub mod __private {
 
 pub mod prelude {
     pub use crate::{
-        Error, EventRequest, Guard, GuardContext, JsonRpcService, RequestHeader, RequestHeaders,
-        UseCase, UseCaseEvent, UseCaseEventConsumer,
+        ContextBuilderRequest, Error, EventRequest, Guard, GuardContext, JsonRpcService,
+        RequestContext, RequestHeader, RequestHeaders, UseCase, UseCaseEvent, UseCaseEventConsumer,
+        current_context, with_current_context,
     };
 }

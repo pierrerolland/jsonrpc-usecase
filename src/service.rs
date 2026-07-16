@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    context::{self, ContextBuilderFuture, ContextBuilderRequest, RequestContext},
     event::{self, EventRequest, UseCaseEvent},
     guard::{GuardContext, RequestHeaders},
     method::MethodSuccess,
@@ -13,6 +14,7 @@ use std::{
     collections::HashMap,
     error::Error as StdError,
     fmt::{self, Display, Formatter},
+    future::Future,
     sync::Arc,
 };
 
@@ -89,6 +91,11 @@ impl JsonRpcService {
         value: Value,
         headers: &RequestHeaders,
     ) -> HandledValue {
+        let request_context = self
+            .config
+            .build_context(ContextBuilderRequest::new(headers.clone()))
+            .await;
+
         match value {
             Value::Array(items) if items.is_empty() => HandledValue {
                 response: Some(
@@ -106,7 +113,7 @@ impl JsonRpcService {
                 let handled_items = join_all(
                     items
                         .into_iter()
-                        .map(|item| self.handle_single(item, headers)),
+                        .map(|item| self.handle_single(item, headers, request_context.clone())),
                 )
                 .await;
                 let mut responses = Vec::new();
@@ -134,7 +141,7 @@ impl JsonRpcService {
                 }
             }
             value => {
-                let handled = self.handle_single(value, headers).await;
+                let handled = self.handle_single(value, headers, request_context).await;
                 HandledValue {
                     response: handled.response.map(Value::from),
                     did_events: handled.did_event.into_iter().collect(),
@@ -143,7 +150,12 @@ impl JsonRpcService {
         }
     }
 
-    async fn handle_single(&self, value: Value, headers: &RequestHeaders) -> HandledSingle {
+    async fn handle_single(
+        &self,
+        value: Value,
+        headers: &RequestHeaders,
+        request_context: RequestContext,
+    ) -> HandledSingle {
         let request = match ValidRequest::try_from(value) {
             Ok(request) => request,
             Err(error) => {
@@ -155,7 +167,9 @@ impl JsonRpcService {
         };
 
         let id = request.id.clone();
-        let result = self.execute_request(request, headers).await;
+        let result = self
+            .execute_request(request, headers, request_context)
+            .await;
 
         match (id, result) {
             (Some(id), Ok(success)) => HandledSingle {
@@ -181,6 +195,7 @@ impl JsonRpcService {
         &self,
         request: ValidRequest,
         headers: &RequestHeaders,
+        request_context: RequestContext,
     ) -> Result<MethodSuccess, JsonRpcErrorObject> {
         let method_name = request.method.clone();
         let method = self.methods.get(&request.method).cloned().ok_or_else(|| {
@@ -190,10 +205,10 @@ impl JsonRpcService {
         })?;
 
         let event_request = EventRequest::from_valid_request(&request);
-        let context = GuardContext::new(headers.clone(), event_request);
+        let context = GuardContext::new(headers.clone(), event_request, request_context.clone());
         let params = request.params;
 
-        method.call(context, params).await
+        context::scope(request_context, method.call(context, params)).await
     }
 }
 
@@ -214,7 +229,37 @@ pub struct JsonRpcServiceBuilder {
 
 impl JsonRpcServiceBuilder {
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.config = Config::new(endpoint);
+        self.config.set_endpoint(endpoint);
+        self
+    }
+
+    pub fn context_builder<Context, Builder>(mut self, builder: Builder) -> Self
+    where
+        Context: Send + Sync + 'static,
+        Builder: Fn(ContextBuilderRequest) -> Context + Send + Sync + 'static,
+    {
+        self.config
+            .set_context_builder(Arc::new(move |request| -> ContextBuilderFuture {
+                Box::pin(std::future::ready(RequestContext::new(builder(request))))
+            }));
+        self
+    }
+
+    pub fn async_context_builder<Context, Builder, ContextFuture>(
+        mut self,
+        builder: Builder,
+    ) -> Self
+    where
+        Context: Send + Sync + 'static,
+        Builder: Fn(ContextBuilderRequest) -> ContextFuture + Send + Sync + 'static,
+        ContextFuture: Future<Output = Context> + Send + 'static,
+    {
+        self.config
+            .set_context_builder(Arc::new(move |request| -> ContextBuilderFuture {
+                let context = builder(request);
+
+                Box::pin(async move { RequestContext::new(context.await) })
+            }));
         self
     }
 

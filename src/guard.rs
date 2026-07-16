@@ -1,4 +1,4 @@
-use crate::event::EventRequest;
+use crate::{context::RequestContext, event::EventRequest};
 
 pub trait Guard: Default + Send + Sync + 'static {
     fn can_proceed(&self, context: &GuardContext) -> bool;
@@ -8,11 +8,20 @@ pub trait Guard: Default + Send + Sync + 'static {
 pub struct GuardContext {
     headers: RequestHeaders,
     request: EventRequest,
+    context: RequestContext,
 }
 
 impl GuardContext {
-    pub(crate) fn new(headers: RequestHeaders, request: EventRequest) -> Self {
-        Self { headers, request }
+    pub(crate) fn new(
+        headers: RequestHeaders,
+        request: EventRequest,
+        context: RequestContext,
+    ) -> Self {
+        Self {
+            headers,
+            request,
+            context,
+        }
     }
 
     pub fn headers(&self) -> &RequestHeaders {
@@ -21,6 +30,17 @@ impl GuardContext {
 
     pub fn request(&self) -> &EventRequest {
         &self.request
+    }
+
+    pub fn context(&self) -> &RequestContext {
+        &self.context
+    }
+
+    pub fn get_context<T>(&self) -> Option<&T>
+    where
+        T: 'static,
+    {
+        self.context.get()
     }
 }
 

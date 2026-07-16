@@ -1,4 +1,9 @@
-use crate::{JSONRPC_VERSION, registry::UseCaseEventConsumerRegistration, request::ValidRequest};
+use crate::{
+    JSONRPC_VERSION,
+    context::{self, RequestContext},
+    registry::UseCaseEventConsumerRegistration,
+    request::ValidRequest,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -13,7 +18,7 @@ type TypedPayload = Arc<dyn Any + Send + Sync>;
 pub(crate) async fn publish(event: &UseCaseEvent) {
     for registration in inventory::iter::<UseCaseEventConsumerRegistration> {
         if registration.event == event.name() {
-            (registration.consumer)(event).await;
+            context::scope(event.context().clone(), (registration.consumer)(event)).await;
         }
     }
 }
@@ -77,6 +82,7 @@ impl EventRequest {
 pub struct UseCaseEvent {
     name: &'static str,
     request: EventRequest,
+    context: RequestContext,
     input: Value,
     output: Option<Value>,
     typed_input: Option<TypedPayload>,
@@ -87,6 +93,7 @@ impl UseCaseEvent {
     pub(crate) fn will_typed<Input>(
         name: &'static str,
         request: EventRequest,
+        context: RequestContext,
         input: Value,
         typed_input: Arc<Input>,
     ) -> Self
@@ -98,6 +105,7 @@ impl UseCaseEvent {
         Self {
             name,
             request,
+            context,
             input,
             output: None,
             typed_input: Some(typed_input),
@@ -108,6 +116,7 @@ impl UseCaseEvent {
     pub(crate) fn did_typed<Input, Output>(
         name: &'static str,
         request: EventRequest,
+        context: RequestContext,
         input: Value,
         output: Value,
         typed_input: Arc<Input>,
@@ -122,6 +131,7 @@ impl UseCaseEvent {
         Self {
             name,
             request,
+            context,
             input,
             output: Some(output),
             typed_input: Some(typed_input),
@@ -135,6 +145,17 @@ impl UseCaseEvent {
 
     pub fn request(&self) -> &EventRequest {
         &self.request
+    }
+
+    pub fn context(&self) -> &RequestContext {
+        &self.context
+    }
+
+    pub fn get_context<Context>(&self) -> Option<&Context>
+    where
+        Context: 'static,
+    {
+        self.context.get()
     }
 
     pub fn input(&self) -> &Value {

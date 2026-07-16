@@ -35,6 +35,7 @@ Developer-facing items:
 - `JsonRpcServiceBuilder`: builder returned by `JsonRpcService::builder()`.
 - `EventRequest` and `UseCaseEvent`: event payload types.
 - `GuardContext` and `RequestHeaders`: guard payload types.
+- `ContextBuilderRequest`, `RequestContext`, `current_context`, and `with_current_context`: request context APIs.
 - `RegistrationError`: returned when the auto-registration registry is invalid, for example duplicate method names.
 
 The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro support module are internal. Treat responses as JSON returned by `JsonRpcService`.
@@ -43,7 +44,7 @@ The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro supp
 
 ```toml
 [dependencies]
-jsonrpc-usecase = "0.4"
+jsonrpc-usecase = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
@@ -61,7 +62,7 @@ For the optional Axum adapter:
 
 ```toml
 [dependencies]
-jsonrpc-usecase = { version = "0.4", features = ["axum"] }
+jsonrpc-usecase = { version = "0.5", features = ["axum"] }
 ```
 
 ## Define A Use Case
@@ -218,6 +219,74 @@ let response = service.handle_value_with_headers(
 
 `handle_json` and `handle_value` use an empty header set. The Axum adapter passes incoming HTTP request headers automatically.
 
+## Request Context
+
+You can build one typed context value per incoming HTTP request and make it available to guards, use cases, and event consumers. The proc macro does not change the `execute(&self, input)` signature; use cases read the current context from the runtime scope.
+
+```rust,ignore
+use jsonrpc_usecase::{JsonRpcService, current_context};
+
+#[derive(Clone)]
+struct CallerContext {
+    user_id: Option<String>,
+    role: String,
+    trace_id: Option<String>,
+}
+
+let service = JsonRpcService::builder()
+    .endpoint("/rpc")
+    .context_builder(|request| CallerContext {
+        user_id: request.headers().get("x-user-id").map(str::to_owned),
+        role: request.headers().get("x-role").unwrap_or("guest").to_owned(),
+        trace_id: request.headers().get("x-trace-id").map(str::to_owned),
+    })
+    .build()?;
+```
+
+Inside a use case:
+
+```rust,ignore
+#[UseCase]
+impl ReadAccount {
+    async fn execute(&self, input: ReadAccountInput) -> Result<ReadAccountOutput, ReadAccountError> {
+        let caller = current_context::<CallerContext>()
+            .expect("CallerContext was configured on the service");
+
+        if caller.user_id.as_deref() != Some(input.account_owner_id.as_str()) {
+            return Err(ReadAccountError::forbidden());
+        }
+
+        todo!()
+    }
+}
+```
+
+Guards receive the same context through `GuardContext`:
+
+```rust,ignore
+impl Guard for RequireAdmin {
+    fn can_proceed(&self, context: &GuardContext) -> bool {
+        context
+            .get_context::<CallerContext>()
+            .is_some_and(|caller| caller.role == "admin")
+    }
+}
+```
+
+Event consumers receive it through `UseCaseEvent`:
+
+```rust,ignore
+impl AuditReadAccount {
+    async fn consume(&self, event: &UseCaseEvent) {
+        let caller = event.get_context::<CallerContext>();
+        let request = event.request();
+        let output = event.output();
+    }
+}
+```
+
+Use `async_context_builder` when building the context needs async work, for example loading a session from a database. In JSON-RPC batches, the context builder runs once for the HTTP request and the resulting context is shared by every item in the batch.
+
 ## Build The Service
 
 All `#[UseCase]` impl blocks linked into the binary are auto-registered when the service is built.
@@ -348,8 +417,10 @@ impl UpdateAddNumbersMetrics {
 
 - `name()`: the event name.
 - `request()`: the JSON-RPC request snapshot, including `jsonrpc`, `method`, optional `params`, and optional `id`.
+- `context()`: the typed request context wrapper built by the service.
 - `input()`: the normalized use-case input payload as `serde_json::Value`.
 - `output()`: `None` for `Will*` events and `Some(value)` for `Did*` events.
+- `get_context::<T>()`: the typed request context when `T` is the configured context type.
 - `get_input::<T>()`: the typed input payload when `T` is the use-case input type.
 - `get_output::<T>()`: the typed output payload for `Did*` events when `T` is the use-case output type.
 
