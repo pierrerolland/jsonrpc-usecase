@@ -5,7 +5,9 @@ mod config;
 mod context;
 mod error;
 mod event;
+mod execution;
 mod guard;
+mod input;
 mod method;
 mod registry;
 mod request;
@@ -19,8 +21,10 @@ pub mod axum;
 pub use context::{ContextBuilderRequest, RequestContext, current_context, with_current_context};
 pub use error::Error;
 pub use event::{EventRequest, UseCaseEvent};
+pub use execution::UseCaseExecutionError;
 pub use guard::{Guard, GuardContext, RequestHeader, RequestHeaders};
-pub use jsonrpc_usecase_macros::{UseCase, UseCaseEventConsumer};
+pub use input::{InputValidationErrors, InputViolation, UseCaseInput};
+pub use jsonrpc_usecase_macros::{UseCase, UseCaseEventConsumer, UseCaseInput};
 pub use service::{JsonRpcService, JsonRpcServiceBuilder, RegistrationError};
 
 pub(crate) const JSONRPC_VERSION: &str = "2.0";
@@ -29,6 +33,10 @@ pub(crate) const JSONRPC_VERSION: &str = "2.0";
 pub mod __private {
     pub use crate::{
         guard::{Guard, GuardContext},
+        input::{
+            InputProcessorRegistration, InputValidationErrors, InputViolation, UseCaseInput,
+            transformers, validators,
+        },
         method::{RpcMethod, UseCaseMethod},
         registry::{
             UseCaseEventConsumerFuture, UseCaseEventConsumerRegistration, UseCaseRegistration,
@@ -42,6 +50,6 @@ pub mod prelude {
     pub use crate::{
         ContextBuilderRequest, Error, EventRequest, Guard, GuardContext, JsonRpcService,
         RequestContext, RequestHeader, RequestHeaders, UseCase, UseCaseEvent, UseCaseEventConsumer,
-        current_context, with_current_context,
+        UseCaseExecutionError, UseCaseInput, current_context, with_current_context,
     };
 }

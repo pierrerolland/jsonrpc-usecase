@@ -6,6 +6,18 @@ use syn::{
     punctuated::Punctuated,
 };
 
+mod input;
+
+#[proc_macro_derive(UseCaseInput, attributes(transform, validate))]
+pub fn derive_use_case_input(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+
+    match input::expand(input) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
 #[allow(non_snake_case)]
 #[proc_macro_attribute]
 pub fn UseCase(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -32,7 +44,7 @@ pub fn UseCaseEventConsumer(args: TokenStream, input: TokenStream) -> TokenStrea
 
 fn expand_use_case(
     args: Punctuated<Meta, syn::Token![,]>,
-    item_impl: ItemImpl,
+    mut item_impl: ItemImpl,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if item_impl.trait_.is_some() {
         return Err(syn::Error::new_spanned(
@@ -48,8 +60,8 @@ fn expand_use_case(
         ));
     }
 
-    let self_ty = item_impl.self_ty.as_ref();
-    let use_case_name = use_case_name(self_ty)?;
+    let self_ty = (*item_impl.self_ty).clone();
+    let use_case_name = use_case_name(&self_ty)?;
     let args = use_case_args_from_args(args)?;
     let method = args.method.unwrap_or_else(|| use_case_name.clone());
     let method = LitStr::new(&method, proc_macro2::Span::call_site());
@@ -63,12 +75,48 @@ fn expand_use_case(
         proc_macro2::Span::call_site(),
     );
 
-    let execute = execute_method(&item_impl)?;
-    let input_ty = input_type(execute)?;
-    let (output_ty, error_ty) = result_output_types(execute)?;
+    let (input_ty, output_ty, error_ty) = {
+        let execute = execute_method(&item_impl)?;
+        let input_ty = input_type(execute)?;
+        let (output_ty, error_ty) = result_output_types(execute)?;
+        (input_ty, output_ty, error_ty)
+    };
+
+    let prepared_execute = format_ident!("__jsonrpc_usecase_execute_prepared");
+
+    if item_impl
+        .items
+        .iter()
+        .any(|item| matches!(item, ImplItem::Fn(method) if method.sig.ident == prepared_execute))
+    {
+        return Err(syn::Error::new_spanned(
+            &item_impl,
+            "UseCase reserves `__jsonrpc_usecase_execute_prepared` for its generated implementation",
+        ));
+    }
+
+    let execute = execute_method_mut(&mut item_impl)?;
+    execute.sig.ident = prepared_execute.clone();
+    execute.vis = syn::Visibility::Inherited;
 
     Ok(quote! {
         #item_impl
+
+        impl #self_ty {
+            #[doc = "Transforms and validates the input before executing this use case."]
+            pub async fn execute(
+                &self,
+                input: #input_ty,
+            ) -> ::std::result::Result<
+                #output_ty,
+                ::jsonrpc_usecase::UseCaseExecutionError<#error_ty>,
+            > {
+                <#self_ty as ::jsonrpc_usecase::__private::UseCaseDefinition>::execute(
+                    self,
+                    input,
+                ).await
+            }
+        }
 
         impl ::jsonrpc_usecase::__private::UseCaseDefinition for #self_ty {
             type Input = #input_ty;
@@ -85,11 +133,11 @@ fn expand_use_case(
                 ))*
             }
 
-            fn execute(
+            fn execute_prepared(
                 &self,
                 input: Self::Input,
             ) -> impl ::std::future::Future<Output = ::std::result::Result<Self::Output, Self::Error>> + Send {
-                #self_ty::execute(self, input)
+                #self_ty::#prepared_execute(self, input)
             }
         }
 
@@ -459,6 +507,20 @@ fn execute_method(item_impl: &ItemImpl) -> syn::Result<&ImplItemFn> {
                 "UseCase requires an async `execute(&self, input) -> Result<Output, Error>` method",
             )
         })
+}
+
+fn execute_method_mut(item_impl: &mut ItemImpl) -> syn::Result<&mut ImplItemFn> {
+    let execute = item_impl.items.iter_mut().find_map(|item| match item {
+        ImplItem::Fn(method) if method.sig.ident == "execute" => Some(method),
+        _ => None,
+    });
+
+    execute.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &item_impl.self_ty,
+            "UseCase requires an async `execute(&self, input) -> Result<Output, Error>` method",
+        )
+    })
 }
 
 fn input_type(method: &ImplItemFn) -> syn::Result<Type> {

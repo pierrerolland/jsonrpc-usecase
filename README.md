@@ -28,6 +28,9 @@ use jsonrpc_usecase::prelude::*;
 Developer-facing items:
 
 - `UseCase`: attribute macro applied to an inherent `impl` block.
+- `UseCaseInput`: derive macro and trait for use-case input transformations and validation.
+- `InputValidationErrors` and `InputViolation`: structured validation results for direct use.
+- `UseCaseExecutionError`: distinguishes invalid input from a use case's execution error.
 - `UseCaseEventConsumer`: attribute macro applied to an event consumer struct, function, or impl block.
 - `Error`: trait implemented by application error types.
 - `Guard`: trait implemented by access-control guard types.
@@ -44,7 +47,7 @@ The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro supp
 
 ```toml
 [dependencies]
-jsonrpc-usecase = "0.5"
+jsonrpc-usecase = "0.6.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
@@ -62,7 +65,7 @@ For the optional Axum adapter:
 
 ```toml
 [dependencies]
-jsonrpc-usecase = { version = "0.5", features = ["axum"] }
+jsonrpc-usecase = { version = "0.6.0", features = ["axum"] }
 ```
 
 ## Define A Use Case
@@ -130,6 +133,213 @@ async fn execute(&self, input: Input) -> Result<Output, Error>
 The macro also implements the hidden runtime trait and submits the use case to the global registry.
 
 Current constraint: macro-registered use-case structs must implement `Default`, because the service can no longer receive explicit instances during registration.
+
+## Validate And Transform Inputs
+
+Derive `UseCaseInput` on any use-case input that needs preprocessing. Put transformations and validators on its fields:
+
+```rust,ignore
+use jsonrpc_usecase::{UseCase, UseCaseInput};
+use serde::Deserialize;
+
+#[derive(Deserialize, UseCaseInput)]
+struct CreateAccountInput {
+    #[transform(trim, lowercase)]
+    #[validate(not_blank, email, length(max = 254))]
+    email: String,
+
+    #[transform(trim, collapse_whitespace)]
+    #[validate(not_blank, length(min = 2, max = 80))]
+    display_name: String,
+
+    #[validate(range(min = 18, max = 120))]
+    age: u8,
+
+    #[validate(required)]
+    referral_code: Option<String>,
+
+    #[transform(each(trim, lowercase), sort, dedup)]
+    #[validate(length(max = 10), unique, each(not_blank, length(max = 24)))]
+    tags: Vec<String>,
+}
+
+#[derive(Default)]
+struct CreateAccount;
+
+#[UseCase]
+impl CreateAccount {
+    async fn execute(
+        &self,
+        input: CreateAccountInput,
+    ) -> Result<CreateAccountOutput, CreateAccountError> {
+        // The generated outer `execute` guarantees prepared input here.
+        todo!()
+    }
+}
+```
+
+No option is needed on `#[UseCase]`. When the use case is exposed as JSON-RPC, a derived input is discovered automatically. Existing inputs that only derive `Deserialize` keep their current behavior.
+
+Processing has these guarantees:
+
+- Every transformation runs, in declaration order, before any validator.
+- Validation happens before the developer-authored `execute` body; JSON-RPC performs it after deserialization and before `Will*` events.
+- All field violations are collected; validation does not stop at the first failure.
+- Validators skip `None`. Add `required` when an `Option<T>` must contain a value.
+- `length` counts Unicode scalar values for strings and elements for collections, not UTF-8 bytes.
+- `each(...)` applies its rules to every `Vec` or array element and reports paths such as `tags[2]`.
+- A custom message can be set with list syntax, for example `email(message = "enter a valid address")`.
+
+Validation failures use the standard JSON-RPC invalid-params code and do not execute the use case:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32602,
+    "message": "Invalid params",
+    "data": {
+      "violations": [
+        {
+          "field": "displayName",
+          "rule": "length",
+          "message": "must contain at least 2 item(s)"
+        }
+      ]
+    }
+  },
+  "id": 1
+}
+```
+
+Validation belongs to the use-case input, not to JSON-RPC. `#[UseCase]` turns the developer-defined `execute` body into the prepared implementation and exposes an outer `execute(input)` method that always transforms and validates first:
+
+```rust,ignore
+use jsonrpc_usecase::UseCaseExecutionError;
+
+match CreateAccount::default().execute(input).await {
+    Ok(output) => { /* use output */ }
+    Err(UseCaseExecutionError::InvalidInput(violations)) => {
+        // Inspect or propagate every InputViolation.
+    }
+    Err(UseCaseExecutionError::Execution(error)) => {
+        // Handle CreateAccountError.
+    }
+}
+```
+
+Use `execute` in every context, including when nesting one use case inside another. At call sites it returns `UseCaseExecutionError<YourError>`. A parent use case can implement `From<UseCaseExecutionError<ChildError>>` for its own error and propagate with `?`, or map the error explicitly. Only the JSON-RPC adapter translates `InvalidInput` into an invalid-params response; direct callers receive the violation normally.
+
+Inputs can also be prepared without executing their use case. Calling `process()` or `into_processed()` returns `InputValidationErrors` directly:
+
+```rust,ignore
+use jsonrpc_usecase::{InputValidationErrors, UseCaseInput};
+
+fn prepare_internal_call(
+    input: CreateAccountInput,
+) -> Result<CreateAccountInput, InputValidationErrors> {
+    input.into_processed()
+}
+```
+
+`InputValidationErrors` also implements `std::error::Error`. For an existing mutable value, the two processing phases are public:
+
+```rust,ignore
+input.process()?; // transform, then validate
+
+// Or invoke the two phases separately:
+input.transform();
+input.validate()?;
+```
+
+### Validator Catalog
+
+Rules without arguments use their bare name. Single-value rules support `rule = value`; rules with several arguments use `rule(name = value, ...)`.
+
+| Category | Rule | Applies to / behavior |
+| --- | --- | --- |
+| Presence | `required` | `Option<T>` must be `Some` |
+| Size | `not_empty` | String or collection has at least one item |
+| Size | `not_blank` | String contains a non-whitespace character |
+| Size | `length(min = n, max = n)` | Inclusive string/collection length; either bound may be omitted |
+| Size | `length(exact = n)` | Exact string/collection length |
+| String | `ascii` | Contains only ASCII characters |
+| String | `alphabetic` | Non-empty and all characters are alphabetic |
+| String | `alphanumeric` | Non-empty and all characters are alphabetic or numeric |
+| String | `numeric` | Non-empty and all characters are numeric |
+| String | `lowercase`, `uppercase` | All cased characters use the requested case |
+| String | `contains = "x"` | Contains a substring |
+| String | `starts_with = "x"`, `ends_with = "x"` | Has the requested boundary text |
+| Format | `email` | ASCII mailbox plus a qualified hostname or bracketed IP address |
+| Format | `url` | Absolute URL accepted by the URL standard parser |
+| Format | `regex = "..."` | Matches a cached regular expression |
+| Format | `uuid` | UUID accepted by the UUID parser |
+| Format | `ip`, `ipv4`, `ipv6` | IP address of the requested kind |
+| Format | `hostname` | Valid ASCII hostname labels and lengths |
+| Format | `slug` | Lowercase ASCII letters, digits, and single interior hyphens |
+| Format | `hex` | Non-empty, even-length hexadecimal text |
+| Format | `base64`, `base64_url` | Standard or URL-safe Base64; URL-safe accepts padded or unpadded input |
+| Number | `min = n`, `max = n` | Inclusive minimum or maximum |
+| Number | `range(min = n, max = n)` | Inclusive range |
+| Number | `positive`, `negative` | Strict sign check |
+| Number | `non_positive`, `non_negative` | Inclusive sign check |
+| Number | `finite` | Finite `f32` or `f64` value |
+| Number | `integer` | Integer primitive, or float with no fractional part |
+| Number | `multiple_of = n` | Integer or floating-point multiple |
+| Number | `even`, `odd` | Integer parity |
+| Equality | `equals = value`, `not_equals = value` | Equality check using the field type |
+| Equality | `one_of = [a, b, c]` | Value appears in the configured set |
+| Collection | `unique` | `Vec` or array contains no duplicates |
+| Collection | `each(rule, ...)` | Applies validators to every element |
+| Object | `nested` | Runs another derived `UseCaseInput` and prefixes its field paths |
+| Extension | `custom = function` | Calls `fn(&T) -> Result<(), E>` where `E: Display`; normal deref coercions apply |
+
+For nested inputs, derive `UseCaseInput` on both structs and mark the child field:
+
+```rust,ignore
+#[derive(Deserialize, UseCaseInput)]
+struct AddressInput {
+    #[transform(trim)]
+    #[validate(not_blank)]
+    street: String,
+}
+
+#[derive(Deserialize, UseCaseInput)]
+struct CreateAccountInput {
+    #[validate(nested)]
+    address: AddressInput,
+
+    #[validate(each(nested))]
+    previous_addresses: Vec<AddressInput>,
+}
+```
+
+`nested` also applies the child transformations before validating it.
+
+### Transformer Catalog
+
+| Category | Rule | Behavior |
+| --- | --- | --- |
+| Whitespace | `trim`, `trim_start`, `trim_end` | Removes Unicode whitespace at the requested boundary |
+| Whitespace | `collapse_whitespace` | Trims and replaces each whitespace run with one ASCII space |
+| Whitespace | `remove_whitespace` | Removes every Unicode whitespace character |
+| Case | `lowercase`, `uppercase` | Applies Unicode case conversion |
+| Case | `capitalize` | Uppercases the first character |
+| Case | `titlecase` | Uppercases each word start and lowercases its remaining characters |
+| String | `replace(from = "x", to = "y")` | Replaces every matching substring |
+| String | `strip_prefix = "x"`, `strip_suffix = "x"` | Removes one matching prefix or suffix |
+| String | `truncate = n` | Keeps at most `n` Unicode scalar values |
+| Unicode | `normalize_nfc`, `normalize_nfkc` | Applies canonical or compatibility normalization |
+| Number | `clamp(min = n, max = n)` | Clamps to an inclusive range |
+| Number | `abs` | Absolute value for signed integers and floats |
+| Number | `round(precision = n)` | Rounds a float; `precision` defaults to zero |
+| Number | `floor`, `ceil` | Rounds a float down or up |
+| Collection | `sort` | Sorts a `Vec` or array using `Ord` |
+| Collection | `dedup` | Removes consecutive duplicate `Vec` values; use after `sort` for global deduplication |
+| Collection | `each(rule, ...)` | Applies transformers to every element |
+| Extension | `custom = function` | Calls `fn(&mut T)` |
+
+Custom validators use `custom(function = path, name = "rule_name")` when the violation should have a rule name other than `custom`. They also support `message = "..."` like built-in validators.
 
 ## Method Names
 
@@ -418,13 +628,13 @@ impl UpdateAddNumbersMetrics {
 - `name()`: the event name.
 - `request()`: the JSON-RPC request snapshot, including `jsonrpc`, `method`, optional `params`, and optional `id`.
 - `context()`: the typed request context wrapper built by the service.
-- `input()`: the normalized use-case input payload as `serde_json::Value`.
+- `input()`: the normalized original input payload as `serde_json::Value`.
 - `output()`: `None` for `Will*` events and `Some(value)` for `Did*` events.
 - `get_context::<T>()`: the typed request context when `T` is the configured context type.
 - `get_input::<T>()`: the typed input payload when `T` is the use-case input type.
 - `get_output::<T>()`: the typed output payload for `Did*` events when `T` is the use-case output type.
 
-Raw event payload values use the same JSON casing as JSON-RPC requests and responses. Typed payload getters return the concrete Rust input and output values from the use case, without going through `serde_json::Value`. `Will*` consumers are awaited before the use case executes. `Did*` consumers are scheduled after the JSON-RPC response value or string has been constructed and run on a shared background Tokio runtime, so async consumers do not need to create their own runtime and do not delay the response path. Protocol validation failures and invalid params publish no use-case events. Use-case errors publish `Will*`, but not `Did*`.
+Raw event payload values use the same JSON casing as JSON-RPC requests and responses. `input()` preserves the normalized request value, while `get_input::<T>()` returns the transformed, validated Rust input when `T` derives `UseCaseInput`. Typed payload getters do not go through `serde_json::Value`. `Will*` consumers are awaited before the use case executes. `Did*` consumers are scheduled after the JSON-RPC response value or string has been constructed and run on a shared background Tokio runtime, so async consumers do not need to create their own runtime and do not delay the response path. Protocol validation failures and invalid params publish no use-case events. Use-case errors publish `Will*`, but not `Did*`.
 
 ## JSON Field Case
 

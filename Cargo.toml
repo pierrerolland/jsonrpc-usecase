@@ -1,6 +1,6 @@
 [package]
 name = "jsonrpc-usecase"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [workspace]
@@ -13,9 +13,14 @@ axum = ["dep:axum"]
 
 [dependencies]
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "tokio", "http1"] }
+base64 = "0.22"
 futures = { version = "0.3", features = ["executor"] }
 inventory = "0.3"
-jsonrpc-usecase-macros = { version = "0.5.0", path = "jsonrpc-usecase-macros" }
+jsonrpc-usecase-macros = { version = "0.6.0", path = "jsonrpc-usecase-macros" }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time", "net"] }
+unicode-normalization = "0.1"
+url = "2"
+uuid = "1"

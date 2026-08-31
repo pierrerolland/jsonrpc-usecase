@@ -3,10 +3,10 @@ use crate::{
     context::RequestContext,
     event::{self, UseCaseEvent},
     guard::GuardContext,
+    input::InputValidationErrors,
     response::JsonRpcErrorObject,
     use_case::UseCaseDefinition,
 };
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -57,7 +57,7 @@ where
                 event_input,
                 will_event_input,
                 did_event_input,
-            } = deserialize_input::<U::Input>(params)?;
+            } = deserialize_input::<U>(params)?;
 
             event::publish(&UseCaseEvent::will_typed(
                 U::WILL_EVENT,
@@ -70,7 +70,7 @@ where
 
             let typed_output = self
                 .use_case
-                .execute(input)
+                .execute_prepared(input)
                 .await
                 .map_err(|error| JsonRpcErrorObject::from(&error))?;
 
@@ -104,21 +104,23 @@ struct DeserializedInput<T> {
     did_event_input: Arc<T>,
 }
 
-fn deserialize_input<T>(params: Value) -> Result<DeserializedInput<T>, JsonRpcErrorObject>
+type InputCopies<T> = (T, Arc<T>, Arc<T>);
+
+fn deserialize_input<U>(params: Value) -> Result<DeserializedInput<U::Input>, JsonRpcErrorObject>
 where
-    T: DeserializeOwned,
+    U: UseCaseDefinition,
 {
     let params = case::params_to_rust_case(params);
 
-    match deserialize_input_values(&params) {
+    match deserialize_input_values::<U>(&params) {
         Ok((input, will_event_input, did_event_input)) => Ok(DeserializedInput {
             input,
             event_input: case::value_to_json_case(params),
             will_event_input,
             did_event_input,
         }),
-        Err(error) if matches!(params, Value::Array(ref items) if items.is_empty()) => {
-            deserialize_input_values(&Value::Null)
+        Err(InputFailure::Deserialize(error)) if matches!(params, Value::Array(ref items) if items.is_empty()) => {
+            deserialize_input_values::<U>(&Value::Null)
                 .map(
                     |(input, will_event_input, did_event_input)| DeserializedInput {
                         input,
@@ -127,27 +129,47 @@ where
                         did_event_input,
                     },
                 )
-                .map_err(|_| invalid_params(error))
+                .map_err(|_| invalid_params(InputFailure::Deserialize(error)))
         }
         Err(error) => Err(invalid_params(error)),
     }
 }
 
-fn deserialize_input_values<T>(params: &Value) -> Result<(T, Arc<T>, Arc<T>), serde_json::Error>
+fn deserialize_input_values<U>(params: &Value) -> Result<InputCopies<U::Input>, InputFailure>
 where
-    T: DeserializeOwned,
+    U: UseCaseDefinition,
 {
-    let event_input = Arc::new(serde_json::from_value::<T>(params.clone())?);
+    let input = U::prepare_input(serde_json::from_value::<U::Input>(params.clone())?)?;
+    let will_event_input = U::prepare_input(serde_json::from_value::<U::Input>(params.clone())?)?;
+    let did_event_input = U::prepare_input(serde_json::from_value::<U::Input>(params.clone())?)?;
 
-    Ok((
-        serde_json::from_value::<T>(params.clone())?,
-        Arc::clone(&event_input),
-        event_input,
-    ))
+    let event_input = Arc::new(will_event_input);
+
+    Ok((input, Arc::clone(&event_input), Arc::new(did_event_input)))
 }
 
-fn invalid_params(error: serde_json::Error) -> JsonRpcErrorObject {
-    JsonRpcErrorObject::invalid_params(Some(json!({
-        "reason": error.to_string(),
-    })))
+enum InputFailure {
+    Deserialize(serde_json::Error),
+    Validation(InputValidationErrors),
+}
+
+impl From<serde_json::Error> for InputFailure {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Deserialize(error)
+    }
+}
+
+impl From<InputValidationErrors> for InputFailure {
+    fn from(errors: InputValidationErrors) -> Self {
+        Self::Validation(errors)
+    }
+}
+
+fn invalid_params(error: InputFailure) -> JsonRpcErrorObject {
+    let data = match error {
+        InputFailure::Deserialize(error) => json!({ "reason": error.to_string() }),
+        InputFailure::Validation(errors) => json!({ "violations": errors.violations() }),
+    };
+
+    JsonRpcErrorObject::invalid_params(Some(data))
 }
