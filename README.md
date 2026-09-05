@@ -7,7 +7,7 @@ The intended workflow is:
 1. Define a struct for the use case.
 2. Implement an inherent `async fn execute(&self, input) -> Result<output, error>` method.
 3. Put `#[UseCase]` on that `impl` block.
-4. Build a `JsonRpcService`; all macro-marked use cases are discovered automatically.
+4. Build a `JsonRpcService`; use cases with JSON-RPC enabled are discovered automatically.
 
 No manual use-case registration is required.
 
@@ -47,7 +47,7 @@ The JSON-RPC request parser, response DTOs, dispatcher, registry, and macro supp
 
 ```toml
 [dependencies]
-jsonrpc-usecase = "0.6.0"
+jsonrpc-usecase = "0.7.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ```
@@ -65,7 +65,7 @@ For the optional Axum adapter:
 
 ```toml
 [dependencies]
-jsonrpc-usecase = { version = "0.6.0", features = ["axum"] }
+jsonrpc-usecase = { version = "0.7.0", features = ["axum"] }
 ```
 
 ## Define A Use Case
@@ -130,9 +130,32 @@ The macro validates that the `impl` block contains this shape:
 async fn execute(&self, input: Input) -> Result<Output, Error>
 ```
 
-The macro also implements the hidden runtime trait and submits the use case to the global registry.
+The macro also implements the hidden runtime trait and, by default, submits the use case to the global JSON-RPC registry.
 
-Current constraint: macro-registered use-case structs must implement `Default`, because the service can no longer receive explicit instances during registration.
+Use-case structs with JSON-RPC registration enabled must implement `Default`, because the service constructs their instances automatically.
+
+## Disable JSON-RPC Registration
+
+Set `jsonrpc = false` for a use case that should only be called from Rust:
+
+```rust,ignore
+struct InternalAddNumbers;
+
+#[UseCase(jsonrpc = false)]
+impl InternalAddNumbers {
+    async fn execute(&self, input: AddNumbersInput) -> Result<AddNumbersOutput, AddNumbersError> {
+        Ok(AddNumbersOutput {
+            computed_sum: input.left_operand + input.right_operand,
+        })
+    }
+}
+
+let output = InternalAddNumbers.execute(input).await?;
+```
+
+The use case keeps its generated `execute` method, including input transformations, validation, and `UseCaseExecutionError` handling. It can be called directly or from another use case and does not need to implement `Default`. The existing input, output, and error type requirements still apply.
+
+No JSON-RPC method is registered for it, even if `method = "..."` is also supplied. Requests for an unregistered method return `Method not found` (`-32601`). Registration is enabled by default; `#[UseCase(jsonrpc = true)]` makes that explicit.
 
 ## Validate And Transform Inputs
 
@@ -499,7 +522,7 @@ Use `async_context_builder` when building the context needs async work, for exam
 
 ## Build The Service
 
-All `#[UseCase]` impl blocks linked into the binary are auto-registered when the service is built.
+All `#[UseCase]` impl blocks linked into the binary are auto-registered when the service is built, except those marked `#[UseCase(jsonrpc = false)]`.
 
 ```rust
 use jsonrpc_usecase::{JsonRpcService, RegistrationError};

@@ -18,6 +18,8 @@ pub fn derive_use_case_input(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Generates validated use-case execution and registers a JSON-RPC method by default.
+/// Set `#[UseCase(jsonrpc = false)]` to disable JSON-RPC registration.
 #[allow(non_snake_case)]
 #[proc_macro_attribute]
 pub fn UseCase(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -99,6 +101,23 @@ fn expand_use_case(
     execute.sig.ident = prepared_execute.clone();
     execute.vis = syn::Visibility::Inherited;
 
+    let registration = args.jsonrpc.then(|| {
+        quote! {
+            ::jsonrpc_usecase::__private::inventory::submit! {
+                ::jsonrpc_usecase::__private::UseCaseRegistration {
+                    method: #method,
+                    factory: || {
+                        ::std::sync::Arc::new(
+                            ::jsonrpc_usecase::__private::UseCaseMethod::from(
+                                <#self_ty as ::std::default::Default>::default()
+                            )
+                        )
+                    },
+                }
+            }
+        }
+    });
+
     Ok(quote! {
         #item_impl
 
@@ -141,18 +160,7 @@ fn expand_use_case(
             }
         }
 
-        ::jsonrpc_usecase::__private::inventory::submit! {
-            ::jsonrpc_usecase::__private::UseCaseRegistration {
-                method: #method,
-                factory: || {
-                    ::std::sync::Arc::new(
-                        ::jsonrpc_usecase::__private::UseCaseMethod::from(
-                            <#self_ty as ::std::default::Default>::default()
-                        )
-                    )
-                },
-            }
-        }
+        #registration
     })
 }
 
@@ -301,14 +309,32 @@ fn event_consumer_registration(
 struct UseCaseArgs {
     method: Option<String>,
     guards: Vec<Type>,
+    jsonrpc: bool,
 }
 
 fn use_case_args_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<UseCaseArgs> {
     let mut method = None;
     let mut guards = Vec::new();
+    let mut jsonrpc = true;
 
     for arg in args {
         match arg {
+            Meta::NameValue(name_value) if name_value.path.is_ident("jsonrpc") => {
+                let Expr::Lit(expr_lit) = name_value.value else {
+                    return Err(syn::Error::new_spanned(
+                        name_value,
+                        "expected `jsonrpc = true` or `jsonrpc = false`",
+                    ));
+                };
+                let Lit::Bool(literal) = expr_lit.lit else {
+                    return Err(syn::Error::new_spanned(
+                        expr_lit,
+                        "expected `jsonrpc = true` or `jsonrpc = false`",
+                    ));
+                };
+
+                jsonrpc = literal.value;
+            }
             Meta::NameValue(name_value) if name_value.path.is_ident("method") => {
                 let Expr::Lit(expr_lit) = name_value.value else {
                     return Err(syn::Error::new_spanned(
@@ -354,13 +380,17 @@ fn use_case_args_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Resul
             meta => {
                 return Err(syn::Error::new_spanned(
                     meta,
-                    "expected `method = \"MethodName\"` or `guards = [GuardType, ...]`",
+                    "expected `method = \"MethodName\"`, `guards = [GuardType, ...]`, or `jsonrpc = true/false`",
                 ));
             }
         }
     }
 
-    Ok(UseCaseArgs { method, guards })
+    Ok(UseCaseArgs {
+        method,
+        guards,
+        jsonrpc,
+    })
 }
 
 fn event_name_from_args(args: Punctuated<Meta, syn::Token![,]>) -> syn::Result<LitStr> {
@@ -635,4 +665,25 @@ fn use_case_name(self_ty: &Type) -> syn::Result<String> {
     }
 
     Ok(segment.ident.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn rejects_non_boolean_jsonrpc_options() {
+        for args in [
+            parse_quote!(jsonrpc = "false"),
+            parse_quote!(jsonrpc = 0),
+            parse_quote!(jsonrpc = enabled),
+        ] {
+            let error = use_case_args_from_args(args).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "expected `jsonrpc = true` or `jsonrpc = false`"
+            );
+        }
+    }
 }

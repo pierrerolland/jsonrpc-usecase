@@ -79,7 +79,7 @@ struct GuardedEchoOutput {
     value: String,
 }
 
-#[UseCase(guards = [RequireAccessHeader])]
+#[UseCase(jsonrpc = true, guards = [RequireAccessHeader])]
 impl GuardedEcho {
     async fn execute(&self, input: GuardedEchoInput) -> Result<GuardedEchoOutput, AddNumbersError> {
         Ok(GuardedEchoOutput { value: input.value })
@@ -291,6 +291,15 @@ impl Ping {
     }
 }
 
+struct InternalPing;
+
+#[UseCase(method = "Ping", jsonrpc = false)]
+impl InternalPing {
+    async fn execute(&self, _input: ()) -> Result<&'static str, AddNumbersError> {
+        Ok("internal pong")
+    }
+}
+
 fn service() -> JsonRpcService {
     JsonRpcService::builder()
         .endpoint("/api/rpc")
@@ -339,6 +348,25 @@ fn auto_registers_macro_use_case_and_returns_result() {
             "id": 1
         }))
     );
+}
+
+#[test]
+fn disabled_registration_does_not_conflict_with_an_existing_method() {
+    let response = block_on(service().handle_value(json!({
+        "jsonrpc": "2.0",
+        "method": "Ping",
+        "id": 1,
+    })));
+
+    assert_eq!(
+        response,
+        Some(json!({
+            "jsonrpc": "2.0",
+            "result": "pong",
+            "id": 1,
+        }))
+    );
+    assert_eq!(block_on(InternalPing.execute(())).unwrap(), "internal pong");
 }
 
 #[test]

@@ -79,10 +79,9 @@ impl Error for ProfileError {
     }
 }
 
-#[derive(Default)]
 struct NormalizeStreet;
 
-#[UseCase]
+#[UseCase(jsonrpc = false)]
 impl NormalizeStreet {
     async fn execute(&self, input: AddressInput) -> Result<String, ProfileError> {
         DIRECT_EXECUTIONS.fetch_add(1, Ordering::SeqCst);
@@ -93,10 +92,9 @@ impl NormalizeStreet {
     }
 }
 
-#[derive(Default)]
 struct NormalizeStreetForNesting;
 
-#[UseCase]
+#[UseCase(jsonrpc = false, method = "InternalNormalizeStreet")]
 impl NormalizeStreetForNesting {
     async fn execute(&self, input: AddressInput) -> Result<String, ProfileError> {
         NESTED_CHILD_EXECUTIONS.fetch_add(1, Ordering::SeqCst);
@@ -216,6 +214,29 @@ impl NeverExecuteInvalidProfile {
 
 fn service() -> JsonRpcService {
     JsonRpcService::builder().build().unwrap()
+}
+
+#[test]
+fn disabled_use_cases_are_not_registered_as_jsonrpc_methods() {
+    let service = service();
+
+    for method in [
+        "NormalizeStreet",
+        "NormalizeStreetForNesting",
+        "InternalNormalizeStreet",
+    ] {
+        let response = block_on(service.handle_value(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": { "street": "Rue de Rivoli" },
+            "id": method,
+        })))
+        .unwrap();
+
+        assert_eq!(response["error"]["code"], -32601, "{method}");
+        assert_eq!(response["error"]["message"], "Method not found");
+        assert_eq!(response["id"], method);
+    }
 }
 
 #[test]
